@@ -1,0 +1,29 @@
+use super::{ArpDivision, ArpPattern, Waveform};
+
+#[derive(Clone, Debug)]
+pub enum Command {
+    NoteOn { midi: u8, velocity: f32 },
+    NoteOff { midi: u8 },
+    SetWaveform(Waveform),
+    SetCutoff(f32),
+    SetResonance(f32),
+    SetAttack(f32),
+    SetDecay(f32),
+    SetSustain(f32),
+    SetRelease(f32),
+    SetVolume(f32),
+    SetBend { amount: f32, range: u8 },
+    SetPedal(bool),
+    Panic,
+    SetArpOn(bool),
+    SetArpLatch(bool),
+    SetArpPattern(ArpPattern),
+    SetArpRate(ArpDivision),
+    SetArpTempo(f32),
+    SetArpOctaves(u8),
+    SetArpGate(f32),
+    SetArpPool(Vec<u8>),
+    RestartArp,
+    ClearArp,
+    SetWhammyOn(bool),
+}
