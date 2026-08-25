@@ -1,8 +1,10 @@
 import { Minus, Plus, Volume2 } from "lucide-react";
 import { AuthSlot } from "@/components/auth-slot";
+import { ArpPanel } from "@/components/synth/arp-panel";
 import { EnableOverlay } from "@/components/synth/enable-overlay";
 import { Keyboard } from "@/components/synth/keyboard";
 import { Knob } from "@/components/synth/knob";
+import { PitchWheel } from "@/components/synth/pitch-wheel";
 import { Oscilloscope } from "@/components/synth/oscilloscope";
 import { WaveformSelect } from "@/components/synth/waveform-select";
 import { Button } from "@/components/ui/button";
@@ -34,6 +36,8 @@ export function HelixApp() {
   const octave = useSynth((s) => s.octave);
   const audioReady = useSynth((s) => s.audioReady);
   const pedal = useSynth((s) => s.pedal);
+  const arpOn = useSynth((s) => s.arpOn);
+  const whammyOn = useSynth((s) => s.whammyOn);
   const setWaveform = useSynth((s) => s.setWaveform);
   const setCutoff = useSynth((s) => s.setCutoff);
   const setResonance = useSynth((s) => s.setResonance);
@@ -153,6 +157,10 @@ export function HelixApp() {
             </div>
           </div>
 
+          <div className="mt-5">
+            <ArpPanel />
+          </div>
+
           <div className="mt-5 flex flex-col gap-4 border-t border-border/80 pt-4 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <Button
@@ -190,6 +198,20 @@ export function HelixApp() {
               >
                 Sustain
               </span>
+              <span
+                className={`rounded-full px-2 py-1 text-2xs font-medium uppercase tracking-[0.12em] ${
+                  arpOn ? "bg-accent text-accent-fg" : "bg-elevated text-subtle"
+                }`}
+              >
+                Arp
+              </span>
+              <span
+                className={`rounded-full px-2 py-1 text-2xs font-medium uppercase tracking-[0.12em] ${
+                  whammyOn ? "bg-accent text-accent-fg" : "bg-elevated text-subtle"
+                }`}
+              >
+                Whammy
+              </span>
             </div>
 
             <div className="flex min-w-0 items-center gap-3 sm:w-64">
@@ -209,14 +231,19 @@ export function HelixApp() {
             </div>
           </div>
 
-          <div className="mt-4">
-            <Keyboard />
+          <div className="mt-4 flex items-stretch gap-3">
+            <PitchWheel />
+            <div className="min-w-0 flex-1">
+              <Keyboard />
+            </div>
           </div>
         </section>
 
         <p className="px-1 text-center text-xs text-subtle sm:text-left">
-          Computer keys: Z row and Q row play notes. Space holds sustain. [ and ]
-          shift octave. Esc silences all.
+          Whammy loops the Map of the Problematique octave pattern (−1 / 0 / +1)
+          on 16ths. Pair it with a loop and twist the filter. Latch holds your
+          chord. Drag the bend wheel or hold up/down arrows. Z and Q rows play
+          notes, Space sustains, [ ] shifts octave, Esc silences all.
         </p>
       </main>
     </div>

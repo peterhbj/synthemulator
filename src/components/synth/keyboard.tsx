@@ -33,6 +33,7 @@ export function Keyboard() {
   const shiftOctave = useSynth((s) => s.shiftOctave);
   const panic = useSynth((s) => s.panic);
   const enableAudio = useSynth((s) => s.enableAudio);
+  const arpPool = useSynth((s) => s.arpPool);
 
   const pointerNotes = useRef(new Map<number, number>());
   const keyHeld = useRef(new Map<string, number>());
@@ -40,6 +41,7 @@ export function Keyboard() {
   const whiteCount = countWhiteKeys(midis);
   const base = octaveBaseMidi(octave);
   const active = new Set(activeNotes);
+  const pooled = new Set(arpPool);
 
   const press = useCallback(
     (midi: number) => {
@@ -161,6 +163,7 @@ export function Keyboard() {
           .filter((midi) => !isBlackKey(midi))
           .map((midi) => {
             const lit = active.has(midi);
+            const queued = pooled.has(midi);
             const label = OFFSET_KEY_LABEL[midi - base];
             return (
               <button
@@ -177,6 +180,7 @@ export function Keyboard() {
                 className={cn(
                   "absolute bottom-0 top-0 rounded-b-md bg-key text-key-fg shadow-[inset_0_-10px_18px_color-mix(in_oklab,var(--color-key-fg)_8%,transparent)]",
                   "transition-[background-color,transform,box-shadow] duration-100 ease-out focus-visible:outline-none",
+                  queued && !lit && "shadow-[inset_0_0_0_1px_var(--color-accent)]",
                   lit &&
                     "translate-y-0.5 bg-glow shadow-[inset_0_0_0_1px_color-mix(in_oklab,var(--color-bg)_12%,transparent)]",
                   !audioReady && "opacity-70",
@@ -202,6 +206,7 @@ export function Keyboard() {
           .filter((midi) => isBlackKey(midi))
           .map((midi) => {
             const lit = active.has(midi);
+            const queued = pooled.has(midi);
             const label = OFFSET_KEY_LABEL[midi - base];
             const afterWhite = whiteKeyIndex(midi, base);
             const whiteW = 100 / whiteCount;
@@ -222,6 +227,7 @@ export function Keyboard() {
                 className={cn(
                   "absolute top-0 z-10 rounded-b-md bg-key-sharp text-key-sharp-fg shadow-[var(--shadow-panel)]",
                   "transition-[background-color,transform] duration-100 ease-out focus-visible:outline-none",
+                  queued && !lit && "shadow-[inset_0_0_0_1px_var(--color-accent)]",
                   lit && "translate-y-0.5 bg-fg text-accent-fg",
                 )}
                 style={{

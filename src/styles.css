@@ -62,6 +62,14 @@
   }
 }
 
+.pitch-grooves {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    var(--color-border) 0 2px,
+    transparent 2px 5px
+  );
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

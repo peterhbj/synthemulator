@@ -1,11 +1,24 @@
 import { create } from "zustand";
 import {
+  notesFromPreset,
+  restartArpClock,
+  startArpClock,
+  stopArpClock,
+  type ArpDivision,
+  type ArpPattern,
+  type ArpPresetId,
+} from "./arp";
+import {
   DEFAULT_PARAMS,
   enableEngine,
   getEngine,
   type SynthParams,
   type Waveform,
 } from "./engine";
+import { startWhammyClock, stopWhammyClock } from "./whammy";
+
+export const BEND_RANGES = [2, 7, 12] as const;
+export type BendRange = (typeof BEND_RANGES)[number];
 
 type SynthStore = SynthParams & {
   octave: number;
@@ -13,6 +26,19 @@ type SynthStore = SynthParams & {
   activeNotes: number[];
   heldNotes: number[];
   pedal: boolean;
+  bend: number;
+  bendRange: BendRange;
+  arpOn: boolean;
+  arpLatch: boolean;
+  arpPattern: ArpPattern;
+  arpRate: ArpDivision;
+  arpTempo: number;
+  arpOctaves: number;
+  arpGate: number;
+  arpPreset: ArpPresetId | null;
+  arpPool: number[];
+  whammyOn: boolean;
+  whammyStep: number;
   setWaveform: (waveform: Waveform) => void;
   setCutoff: (cutoff: number) => void;
   setResonance: (resonance: number) => void;
@@ -21,6 +47,18 @@ type SynthStore = SynthParams & {
   setSustainLevel: (sustain: number) => void;
   setRelease: (release: number) => void;
   setVolume: (volume: number) => void;
+  setBend: (bend: number) => void;
+  setBendRange: (range: BendRange) => void;
+  setArpOn: (on: boolean) => void;
+  setArpLatch: (on: boolean) => void;
+  setArpPattern: (pattern: ArpPattern) => void;
+  setArpRate: (rate: ArpDivision) => void;
+  setArpTempo: (tempo: number) => void;
+  setArpOctaves: (octaves: number) => void;
+  setArpGate: (gate: number) => void;
+  loadArpPreset: (id: Exclude<ArpPresetId, "live">) => void;
+  clearArp: () => void;
+  setWhammyOn: (on: boolean) => void;
   shiftOctave: (delta: number) => void;
   enableAudio: () => Promise<void>;
   noteOn: (midi: number) => void;
@@ -33,6 +71,10 @@ function pushParams(partial: Partial<SynthParams>) {
   getEngine()?.setParams(partial);
 }
 
+function pushBend(bend: number, range: number) {
+  getEngine()?.setBend(bend, range);
+}
+
 export const MIN_OCTAVE = 1;
 export const MAX_OCTAVE = 6;
 
@@ -43,6 +85,19 @@ export const useSynth = create<SynthStore>((set, get) => ({
   activeNotes: [],
   heldNotes: [],
   pedal: false,
+  bend: 0,
+  bendRange: 2,
+  arpOn: false,
+  arpLatch: true,
+  arpPattern: "up",
+  arpRate: "8n",
+  arpTempo: 125,
+  arpOctaves: 1,
+  arpGate: 0.62,
+  arpPreset: null,
+  arpPool: [],
+  whammyOn: false,
+  whammyStep: 0,
 
   setWaveform: (waveform) => {
     pushParams({ waveform });
@@ -76,30 +131,127 @@ export const useSynth = create<SynthStore>((set, get) => ({
     pushParams({ volume });
     set({ volume });
   },
+  setBend: (bend) => {
+    const next = Math.min(1, Math.max(-1, bend));
+    pushBend(next, get().bendRange);
+    set({ bend: next });
+  },
+  setBendRange: (range) => {
+    pushBend(get().bend, range);
+    set({ bendRange: range });
+  },
+
+  setArpOn: (on) => {
+    if (on) {
+      const { heldNotes, arpPool } = get();
+      const pool = arpPool.length ? arpPool : [...heldNotes];
+      set({
+        arpOn: true,
+        arpPool: pool,
+        arpPreset: pool.length ? get().arpPreset ?? "live" : get().arpPreset,
+      });
+      startArpClock();
+      return;
+    }
+    stopArpClock();
+    getEngine()?.allNotesOff();
+    set({ arpOn: false, activeNotes: [] });
+  },
+  setArpLatch: (on) => {
+    if (on) {
+      set({ arpLatch: true });
+      return;
+    }
+    const { heldNotes } = get();
+    set({
+      arpLatch: false,
+      arpPool: get().arpPool.filter((n) => heldNotes.includes(n)),
+      arpPreset: "live",
+    });
+  },
+  setArpPattern: (pattern) => {
+    restartArpClock();
+    set({ arpPattern: pattern });
+  },
+  setArpRate: (rate) => set({ arpRate: rate }),
+  setArpTempo: (tempo) => set({ arpTempo: tempo }),
+  setArpOctaves: (octaves) => {
+    restartArpClock();
+    set({ arpOctaves: Math.min(3, Math.max(1, Math.round(octaves))) });
+  },
+  setArpGate: (gate) => set({ arpGate: Math.min(0.95, Math.max(0.12, gate)) }),
+  loadArpPreset: (id) => {
+    const pool = notesFromPreset(id, get().octave);
+    set({
+      arpOn: true,
+      arpLatch: true,
+      arpPreset: id,
+      arpPool: pool,
+    });
+    restartArpClock();
+    startArpClock();
+  },
+  clearArp: () => {
+    stopArpClock();
+    getEngine()?.allNotesOff();
+    set({
+      arpOn: false,
+      arpPool: [],
+      arpPreset: null,
+      activeNotes: [],
+    });
+  },
+  setWhammyOn: (on) => {
+    if (on) {
+      set({ whammyOn: true });
+      startWhammyClock();
+      return;
+    }
+    stopWhammyClock();
+    set({ whammyOn: false, whammyStep: 0 });
+  },
+
   shiftOctave: (delta) => {
-    set((s) => ({
-      octave: Math.min(MAX_OCTAVE, Math.max(MIN_OCTAVE, s.octave + delta)),
-    }));
+    const octave = Math.min(MAX_OCTAVE, Math.max(MIN_OCTAVE, get().octave + delta));
+    const { arpPreset } = get();
+    if (arpPreset && arpPreset !== "live") {
+      set({ octave, arpPool: notesFromPreset(arpPreset, octave) });
+      restartArpClock();
+      return;
+    }
+    set({ octave });
   },
 
   enableAudio: async () => {
     const engine = await enableEngine();
-    const { waveform, cutoff, resonance, attack, decay, sustain, release, volume } =
-      get();
+    const state = get();
     engine.setParams({
-      waveform,
-      cutoff,
-      resonance,
-      attack,
-      decay,
-      sustain,
-      release,
-      volume,
+      waveform: state.waveform,
+      cutoff: state.cutoff,
+      resonance: state.resonance,
+      attack: state.attack,
+      decay: state.decay,
+      sustain: state.sustain,
+      release: state.release,
+      volume: state.volume,
     });
+    engine.setBend(state.bend, state.bendRange);
     set({ audioReady: true });
+    if (state.arpOn) startArpClock();
+    if (state.whammyOn) startWhammyClock();
   },
 
   noteOn: (midi) => {
+    const { arpOn } = get();
+    if (arpOn) {
+      set((s) => ({
+        heldNotes: s.heldNotes.includes(midi) ? s.heldNotes : [...s.heldNotes, midi],
+        arpPool: s.arpPool.includes(midi) ? s.arpPool : [...s.arpPool, midi],
+        arpPreset: "live",
+      }));
+      startArpClock();
+      return;
+    }
     const engine = getEngine();
     if (!engine) return;
     engine.noteOn(midi);
@@ -112,7 +264,14 @@ export const useSynth = create<SynthStore>((set, get) => ({
   },
 
   noteOff: (midi) => {
-    const { pedal } = get();
+    const { arpOn, arpLatch, pedal } = get();
+    if (arpOn) {
+      set((s) => ({
+        heldNotes: s.heldNotes.filter((n) => n !== midi),
+        arpPool: arpLatch ? s.arpPool : s.arpPool.filter((n) => n !== midi),
+      }));
+      return;
+    }
     set((s) => ({
       heldNotes: s.heldNotes.filter((n) => n !== midi),
     }));
@@ -128,7 +287,11 @@ export const useSynth = create<SynthStore>((set, get) => ({
       set({ pedal: true });
       return;
     }
-    const { heldNotes, activeNotes } = get();
+    const { heldNotes, activeNotes, arpOn } = get();
+    if (arpOn) {
+      set({ pedal: false });
+      return;
+    }
     const held = new Set(heldNotes);
     const releasing = activeNotes.filter((n) => !held.has(n));
     for (const midi of releasing) getEngine()?.noteOff(midi);
@@ -139,7 +302,20 @@ export const useSynth = create<SynthStore>((set, get) => ({
   },
 
   panic: () => {
+    stopArpClock();
     getEngine()?.allNotesOff();
-    set({ activeNotes: [], heldNotes: [], pedal: false });
+    getEngine()?.setBend(0, get().bendRange);
+    set({
+      activeNotes: [],
+      heldNotes: [],
+      pedal: false,
+      bend: 0,
+      arpPool:
+        get().arpOn && get().arpPreset && get().arpPreset !== "live"
+          ? get().arpPool
+          : [],
+    });
+    if (get().arpOn && get().arpPool.length) startArpClock();
+    if (get().whammyOn) startWhammyClock();
   },
 }));

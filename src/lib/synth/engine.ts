@@ -43,6 +43,9 @@ export class SynthEngine {
   private readonly master: GainNode;
   private readonly voices = new Map<number, Voice>();
   private params: SynthParams = { ...DEFAULT_PARAMS };
+  private bendAmount = 0;
+  private bendRange = 2;
+  private octaveShift = 0;
 
   constructor() {
     const ctx = new AudioContext();
@@ -101,6 +104,30 @@ export class SynthEngine {
     }
   }
 
+  setBend(amount: number, range = this.bendRange): void {
+    this.bendAmount = Math.min(1, Math.max(-1, amount));
+    this.bendRange = range;
+    this.applyDetune(true);
+  }
+
+  setOctaveShift(semitones: number): void {
+    this.octaveShift = semitones;
+    this.applyDetune(false);
+  }
+
+  private totalCents(): number {
+    return this.bendAmount * this.bendRange * 100 + this.octaveShift * 100;
+  }
+
+  private applyDetune(smooth: boolean): void {
+    const cents = this.totalCents();
+    const now = this.ctx.currentTime;
+    for (const voice of this.voices.values()) {
+      if (smooth) voice.osc.detune.setTargetAtTime(cents, now, 0.008);
+      else voice.osc.detune.setValueAtTime(cents, now);
+    }
+  }
+
   noteOn(midi: number): void {
     if (this.ctx.state !== "running") return;
     const existing = this.voices.get(midi);
@@ -120,6 +147,7 @@ export class SynthEngine {
     const osc = this.ctx.createOscillator();
     osc.type = waveform;
     osc.frequency.setValueAtTime(midiToHz(midi), now);
+    osc.detune.setValueAtTime(this.totalCents(), now);
 
     const gain = this.ctx.createGain();
     gain.gain.setValueAtTime(0.0001, now);
