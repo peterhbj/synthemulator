@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -5,6 +6,7 @@ use cpal::{BufferSize, SampleFormat, StreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::engine::{Engine, Snapshot};
+use super::ring::AudioRing;
 use crate::synth::Command;
 
 pub type AudioError = String;
@@ -15,6 +17,8 @@ pub struct AudioHost {
     _stream: cpal::Stream,
     pub sample_rate: f32,
     pub device_name: String,
+    pub guitar_ring: Arc<AudioRing>,
+    pub guitar_peak: Arc<AtomicU32>,
 }
 
 impl AudioHost {
@@ -34,6 +38,8 @@ impl AudioHost {
         let sample_rate = config.sample_rate.0 as f32;
         let channels = config.channels as usize;
         let (tx, rx) = bounded::<Command>(1024);
+        let guitar_ring = Arc::new(AudioRing::new(16_384));
+        let guitar_peak = Arc::new(AtomicU32::new(0));
         let snapshot = Arc::new(Mutex::new(Snapshot {
             sample_rate,
             ..Snapshot::default()
@@ -47,6 +53,7 @@ impl AudioHost {
                 sample_rate,
                 rx,
                 snapshot.clone(),
+                guitar_ring.clone(),
             )?,
             SampleFormat::I16 => build_stream::<i16>(
                 &device,
@@ -55,6 +62,7 @@ impl AudioHost {
                 sample_rate,
                 rx,
                 snapshot.clone(),
+                guitar_ring.clone(),
             )?,
             SampleFormat::U16 => build_stream::<u16>(
                 &device,
@@ -63,6 +71,7 @@ impl AudioHost {
                 sample_rate,
                 rx,
                 snapshot.clone(),
+                guitar_ring.clone(),
             )?,
             other => {
                 return Err(format!("unsupported sample format: {other}"));
@@ -77,6 +86,8 @@ impl AudioHost {
             _stream: stream,
             sample_rate,
             device_name,
+            guitar_ring,
+            guitar_peak,
         })
     }
 
@@ -100,6 +111,7 @@ fn build_stream<T>(
     sample_rate: f32,
     rx: Receiver<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
+    guitar_ring: Arc<AudioRing>,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -111,7 +123,8 @@ where
     let make = |cfg: &StreamConfig| {
         let rx = rx.clone();
         let snapshot = snapshot.clone();
-        let mut engine = Engine::new(sample_rate);
+        let guitar_ring = guitar_ring.clone();
+        let mut engine = Engine::with_guitar(sample_rate, guitar_ring);
         device.build_output_stream(
             cfg,
             move |data: &mut [T], _| {

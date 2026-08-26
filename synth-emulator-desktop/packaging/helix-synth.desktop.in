@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Helix
+GenericName=Analog keyboard
+Comment=Helix analog synthesizer — keys, MIDI, guitar whammy
+Exec=@BIN@
+TryExec=@BIN@
+Icon=@ICON@
+Terminal=false
+StartupNotify=true
+StartupWMClass=helix-synth
+Categories=AudioVideo;Audio;Music;
+Keywords=synth;synthesizer;midi;guitar;whammy;helix;

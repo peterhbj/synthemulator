@@ -7,6 +7,9 @@ use crate::synth::{
 };
 
 use super::osc;
+use super::pitch::PitchShift;
+use super::ring::AudioRing;
+use std::sync::Arc;
 
 const FILTER_TC: f32 = 0.03;
 const RES_TC: f32 = 0.03;
@@ -216,10 +219,19 @@ pub struct Engine {
     whammy_applied: usize,
     whammy_samples_until: f64,
     rng: Rng,
+    guitar_ring: Arc<AudioRing>,
+    guitar_on: bool,
+    guitar_gain: f32,
+    guitar_shifter: PitchShift,
+    guitar_level: f32,
 }
 
 impl Engine {
     pub fn new(sample_rate: f32) -> Self {
+        Self::with_guitar(sample_rate, Arc::new(AudioRing::new(1024)))
+    }
+
+    pub fn with_guitar(sample_rate: f32, guitar_ring: Arc<AudioRing>) -> Self {
         let params = SynthParams::default();
         let master_coeff = (-1.0 / (VOL_TC * sample_rate)).exp();
         let bend_coeff = (-1.0 / (BEND_TC * sample_rate)).exp();
@@ -258,6 +270,11 @@ impl Engine {
             whammy_applied: 0,
             whammy_samples_until: 0.0,
             rng: Rng(0xC0FFEE_u64.wrapping_mul(sample_rate as u64 + 1)),
+            guitar_ring,
+            guitar_on: false,
+            guitar_gain: 0.85,
+            guitar_shifter: PitchShift::new(sample_rate),
+            guitar_level: 0.0,
             params,
         }
     }
@@ -313,6 +330,8 @@ impl Engine {
             Command::RestartArp => self.restart_arp(),
             Command::ClearArp => self.clear_arp(),
             Command::SetWhammyOn(on) => self.set_whammy_on(on),
+            Command::SetGuitarOn(on) => self.guitar_on = on,
+            Command::SetGuitarGain(g) => self.guitar_gain = g.clamp(0.0, 1.5),
         }
     }
 
@@ -637,6 +656,18 @@ impl Engine {
         for i in 0..n {
             mix += self.tick_voice(i);
         }
+
+        let g_in = self.guitar_ring.pop().unwrap_or(0.0);
+        self.guitar_level = self.guitar_level * 0.995 + g_in.abs() * 0.005;
+        if self.guitar_on {
+            let shifted = if self.whammy_on {
+                self.guitar_shifter.set_semitones(self.octave_shift);
+                self.guitar_shifter.process(g_in)
+            } else {
+                g_in
+            };
+            mix += shifted * self.guitar_gain;
+        }
         self.voices
             .retain(|v| !(matches!(v.stage, EnvStage::Release) && v.gain <= 0.00012));
 
@@ -674,6 +705,8 @@ impl Engine {
             whammy_step: self.whammy_applied,
             bend: self.bend_amount,
             sample_rate: self.sr,
+            guitar_on: self.guitar_on,
+            guitar_level: self.guitar_level,
         }
     }
 }
@@ -690,6 +723,8 @@ pub struct Snapshot {
     pub whammy_step: usize,
     pub bend: f32,
     pub sample_rate: f32,
+    pub guitar_on: bool,
+    pub guitar_level: f32,
 }
 
 #[cfg(test)]

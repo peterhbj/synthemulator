@@ -10,7 +10,7 @@ use super::theme::{self, BG, FG, MUTED, SUBTLE, SURFACE};
 use super::widgets::{
     badge_pill, format_hz, format_ms, format_pct, icon_button, knob, volume_slider, waveform_select,
 };
-use crate::audio::{AudioHost, MidiHub};
+use crate::audio::{AudioHost, GuitarInput, MidiHub};
 use crate::synth::{
     midi_to_name, notes_from_preset, octave_base_midi, ArpDivision, ArpPattern, ArpPresetId,
     Command, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES,
@@ -21,6 +21,8 @@ pub struct HelixApp {
     audio_err: Option<String>,
     midi: Option<MidiHub>,
     midi_err: Option<String>,
+    guitar: Option<GuitarInput>,
+    guitar_err: Option<String>,
     params: SynthParams,
     octave: i32,
     bend: f32,
@@ -34,6 +36,7 @@ pub struct HelixApp {
     spring_from: Option<(f32, f64)>,
     peak: f32,
     was_dragging_bend: bool,
+    midi_poll_at: f64,
 }
 
 impl HelixApp {
@@ -45,12 +48,17 @@ impl HelixApp {
             o.zoom_with_keyboard = false;
         });
 
-        let (audio, audio_err, midi) = match AudioHost::start() {
+        let (audio, audio_err, midi, guitar) = match AudioHost::start() {
             Ok(host) => {
                 let midi = MidiHub::new(host.sender());
-                (Some(host), None, Some(midi))
+                let guitar = GuitarInput::new(
+                    host.guitar_ring.clone(),
+                    host.guitar_peak.clone(),
+                    host.sample_rate,
+                );
+                (Some(host), None, Some(midi), Some(guitar))
             }
-            Err(e) => (None, Some(e), None),
+            Err(e) => (None, Some(e), None, None),
         };
 
         Self {
@@ -58,6 +66,8 @@ impl HelixApp {
             audio_err,
             midi,
             midi_err: None,
+            guitar,
+            guitar_err: None,
             params: SynthParams::default(),
             octave: 3,
             bend: 0.0,
@@ -73,6 +83,8 @@ impl HelixApp {
                 arp_preset: None,
                 whammy_on: false,
                 whammy_step: 0,
+                guitar_on: false,
+                guitar_gain: 0.85,
             },
             pointer_held: HashSet::new(),
             key_held: HashMap::new(),
@@ -82,6 +94,7 @@ impl HelixApp {
             spring_from: None,
             peak: 0.0,
             was_dragging_bend: false,
+            midi_poll_at: 0.0,
         }
     }
 
@@ -210,6 +223,25 @@ impl eframe::App for HelixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
         self.handle_keys(ctx);
+
+        let now = ctx.input(|i| i.time);
+        if now - self.midi_poll_at > 0.8 {
+            self.midi_poll_at = now;
+            if let Some(midi) = self.midi.as_mut() {
+                midi.refresh();
+                if let Err(e) = midi.auto_connect() {
+                    self.midi_err = Some(e);
+                }
+            }
+            if self.arp.guitar_on {
+                if let Some(g) = self.guitar.as_mut() {
+                    g.refresh();
+                    if let Err(e) = g.auto_connect() {
+                        self.guitar_err = Some(e);
+                    }
+                }
+            }
+        }
 
         if self.was_dragging_bend && !self.dragging_bend {
             self.spring_from = Some((self.bend, ctx.input(|i| i.time)));
@@ -427,6 +459,10 @@ impl HelixApp {
                 for ev in events {
                     self.handle_arp_event(ev);
                 }
+                guitar_in_picker(ui, self);
+                if let Some(err) = &self.guitar_err {
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
 
                 ui.add_space(6.0);
                 ui.separator();
@@ -452,6 +488,7 @@ impl HelixApp {
                     badge_pill(ui, "Sustain", snap.pedal);
                     badge_pill(ui, "Arp", self.arp.arp_on);
                     badge_pill(ui, "Whammy", self.arp.whammy_on);
+                    badge_pill(ui, "Guitar", self.arp.guitar_on);
                     ui.allocate_ui(
                         egui::vec2(ui.available_width().clamp(160.0, 280.0), 28.0),
                         |ui| {
@@ -539,6 +576,28 @@ impl HelixApp {
                 self.arp.whammy_on = !self.arp.whammy_on;
                 self.send(Command::SetWhammyOn(self.arp.whammy_on));
             }
+            ArpEvent::ToggleGuitar => {
+                self.arp.guitar_on = !self.arp.guitar_on;
+                self.send(Command::SetGuitarOn(self.arp.guitar_on));
+                if self.arp.guitar_on {
+                    if let Some(g) = self.guitar.as_mut() {
+                        g.hold_off = false;
+                        match g.auto_connect() {
+                            Ok(()) => self.guitar_err = None,
+                            Err(e) => self.guitar_err = Some(e),
+                        }
+                        if g.connected.is_none() {
+                            self.guitar_err = Some(
+                                "Plugue a GT-100 via USB e ligue Guitar On (entrada, não MIDI)."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+            }
+            ArpEvent::GuitarGain => {
+                self.send(Command::SetGuitarGain(self.arp.guitar_gain));
+            }
             ArpEvent::Pattern(p) => {
                 self.arp.arp_pattern = p;
                 self.send(Command::SetArpPattern(p));
@@ -566,6 +625,63 @@ impl HelixApp {
     }
 }
 
+fn short_midi_name(name: &str) -> String {
+    name.split(':').next().unwrap_or(name).trim().to_string()
+}
+
+fn guitar_in_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
+    let Some(gtr) = app.guitar.as_mut() else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(theme::section_label("INPUT"));
+        let peak = gtr.peak();
+        let (meter, _) = ui.allocate_exact_size(egui::vec2(72.0, 10.0), egui::Sense::hover());
+        ui.painter().rect_filled(meter, 4.0, theme::ELEVATED);
+        let w = (peak.clamp(0.0, 1.0)) * meter.width();
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(meter.min, egui::vec2(w, meter.height())),
+            4.0,
+            theme::ACCENT,
+        );
+        let label = gtr
+            .connected
+            .as_deref()
+            .map(short_midi_name)
+            .unwrap_or_else(|| "Guitar in".to_string());
+        egui::ComboBox::from_id_salt("guitar-in")
+            .selected_text(egui::RichText::new(label).size(12.0).color(FG))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(gtr.connected.is_none(), "None")
+                    .clicked()
+                {
+                    gtr.disconnect();
+                }
+                let ports = gtr.devices.clone();
+                if ports.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Nenhuma entrada. Plugue a GT-100 USB.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+                for name in ports {
+                    let selected = gtr.connected.as_deref() == Some(name.as_str());
+                    if ui
+                        .selectable_label(selected, short_midi_name(&name))
+                        .clicked()
+                    {
+                        match gtr.connect(&name) {
+                            Ok(()) => app.guitar_err = None,
+                            Err(e) => app.guitar_err = Some(e),
+                        }
+                    }
+                }
+            });
+    });
+}
+
 fn midi_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
     let Some(midi) = app.midi.as_mut() else {
         ui.label(egui::RichText::new("No MIDI").color(SUBTLE));
@@ -580,31 +696,63 @@ fn midi_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
             .clicked()
         {
             midi.refresh();
-            app.midi_err = None;
+            midi.hold_off = false;
+            match midi.auto_connect() {
+                Ok(()) => app.midi_err = None,
+                Err(e) => app.midi_err = Some(e),
+            }
         }
+        let live = midi.live();
         let label = midi
             .connected
-            .clone()
-            .unwrap_or_else(|| "MIDI in".to_string());
-        egui::ComboBox::from_id_salt("midi-in")
-            .selected_text(egui::RichText::new(label).size(12.0).color(FG))
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(midi.connected.is_none(), "None")
-                    .clicked()
-                {
-                    midi.disconnect();
+            .as_deref()
+            .map(short_midi_name)
+            .unwrap_or_else(|| {
+                if midi.ports.iter().any(|p| {
+                    let l = p.to_ascii_lowercase();
+                    l.contains("keyboard") || l.contains("yamaha")
+                }) {
+                    "Yamaha (tap Refresh)".to_string()
+                } else {
+                    "MIDI in".to_string()
                 }
-                let ports = midi.ports.clone();
-                for name in ports {
-                    let selected = midi.connected.as_deref() == Some(name.as_str());
-                    if ui.selectable_label(selected, &name).clicked() {
-                        match midi.connect(&name) {
-                            Ok(()) => app.midi_err = None,
-                            Err(e) => app.midi_err = Some(e),
+            });
+        let label_color = if live { theme::ACCENT_FG } else { FG };
+        egui::Frame::new()
+            .fill(if live { theme::ACCENT } else { theme::ELEVATED })
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(4, 2))
+            .show(ui, |ui| {
+                egui::ComboBox::from_id_salt("midi-in")
+                    .selected_text(egui::RichText::new(label).size(12.0).color(label_color))
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(midi.connected.is_none(), "None")
+                            .clicked()
+                        {
+                            midi.disconnect();
                         }
-                    }
-                }
+                        let ports = midi.ports.clone();
+                        if ports.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Nenhum dispositivo. Plugue o USB.")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                        }
+                        for name in ports {
+                            let selected = midi.connected.as_deref() == Some(name.as_str());
+                            if ui
+                                .selectable_label(selected, short_midi_name(&name))
+                                .clicked()
+                            {
+                                match midi.connect(&name) {
+                                    Ok(()) => app.midi_err = None,
+                                    Err(e) => app.midi_err = Some(e),
+                                }
+                            }
+                        }
+                    });
             });
     });
 }
@@ -645,15 +793,22 @@ fn computer_key_offset(key: Key) -> Option<u8> {
 }
 
 pub fn run() -> eframe::Result<()> {
+    let icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/helix-synth.png")).ok();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1200.0, 860.0])
+        .with_min_inner_size([880.0, 640.0])
+        .with_title("Helix")
+        .with_app_id("helix-synth");
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 860.0])
-            .with_min_inner_size([880.0, 640.0])
-            .with_title("Helix"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
-        "Helix",
+        "helix-synth",
         options,
         Box::new(|cc| Ok(Box::new(HelixApp::new(cc)))),
     )

@@ -12,6 +12,7 @@ crossbeam-channel = "0.5"
 eframe = { version = "0.32", default-features = true, features = ["wayland"] }
 egui = "0.32"
 midir = "0.10"
+rustfft = "6.4"
 
 [profile.release]
 lto = true

@@ -26,4 +26,6 @@ pub enum Command {
     RestartArp,
     ClearArp,
     SetWhammyOn(bool),
+    SetGuitarOn(bool),
+    SetGuitarGain(f32),
 }

@@ -15,6 +15,8 @@ pub struct ArpUiState {
     pub arp_preset: Option<ArpPresetId>,
     pub whammy_on: bool,
     pub whammy_step: usize,
+    pub guitar_on: bool,
+    pub guitar_gain: f32,
 }
 
 pub enum ArpEvent {
@@ -22,6 +24,8 @@ pub enum ArpEvent {
     ToggleLatch,
     Clear,
     ToggleWhammy,
+    ToggleGuitar,
+    GuitarGain,
     Pattern(ArpPattern),
     Rate(ArpDivision),
     Tempo,
@@ -83,6 +87,40 @@ pub fn arp_panel(ui: &mut Ui, state: &mut ArpUiState) -> Vec<ArpEvent> {
                 });
             });
             whammy_strip(ui, state.whammy_on, state.whammy_step);
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::section_label("GUITAR"));
+                if chip(
+                    ui,
+                    if state.guitar_on { "On" } else { "Off" },
+                    state.guitar_on,
+                )
+                .clicked()
+                {
+                    events.push(ArpEvent::ToggleGuitar);
+                }
+                ui.label(
+                    egui::RichText::new("poly FFT · acorde inteiro −1 / 0 / +1")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+            });
+            ui.horizontal(|ui| {
+                if knob(
+                    ui,
+                    "gtr-gain",
+                    "Gain",
+                    &mut state.guitar_gain,
+                    0.0,
+                    1.5,
+                    0.01,
+                    false,
+                    format_pct,
+                ) {
+                    events.push(ArpEvent::GuitarGain);
+                }
+            });
 
             ui.add_space(6.0);
             ui.label(theme::section_label("MOTION"));
