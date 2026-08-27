@@ -83,28 +83,46 @@ impl GuitarInput {
             .map_err(|e| format!("input config: {e}"))?;
         let mut config: StreamConfig = supported.config();
         config.buffer_size = BufferSize::Fixed(256);
-        let in_sr = config.sample_rate.0 as f32;
-        let channels = config.channels as usize;
+        // Prefer the output graph rate so PipeWire resamples the GT-100
+        // (44.1) onto the same clock instead of Helix RateConv drifting.
+        let want = cpal::SampleRate(self.out_sr.round().max(1.0) as u32);
+        if config.sample_rate != want {
+            config.sample_rate = want;
+        }
         let ring = self.ring.clone();
         let peak = self.peak.clone();
         let out_sr = self.out_sr;
 
-        let stream = match supported.sample_format() {
-            SampleFormat::F32 => {
-                build_input::<f32>(&device, &config, channels, in_sr, out_sr, ring, peak)?
+        let stream = match open_input(&device, &supported, &config, out_sr, ring.clone(), peak.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                let mut native = supported.config();
+                native.buffer_size = BufferSize::Fixed(256);
+                open_input(&device, &supported, &native, out_sr, ring, peak)?
             }
-            SampleFormat::I16 => {
-                build_input::<i16>(&device, &config, channels, in_sr, out_sr, ring, peak)?
-            }
-            SampleFormat::U16 => {
-                build_input::<u16>(&device, &config, channels, in_sr, out_sr, ring, peak)?
-            }
-            other => return Err(format!("formato de entrada: {other}")),
         };
         stream.play().map_err(|e| format!("guitar stream: {e}"))?;
         self.connected = Some(name.to_string());
         self._stream = Some(stream);
         Ok(())
+    }
+}
+
+fn open_input(
+    device: &cpal::Device,
+    supported: &cpal::SupportedStreamConfig,
+    config: &StreamConfig,
+    out_sr: f32,
+    ring: Arc<AudioRing>,
+    peak: Arc<AtomicU32>,
+) -> Result<cpal::Stream, String> {
+    let in_sr = config.sample_rate.0 as f32;
+    let channels = config.channels as usize;
+    match supported.sample_format() {
+        SampleFormat::F32 => build_input::<f32>(device, config, channels, in_sr, out_sr, ring, peak),
+        SampleFormat::I16 => build_input::<i16>(device, config, channels, in_sr, out_sr, ring, peak),
+        SampleFormat::U16 => build_input::<u16>(device, config, channels, in_sr, out_sr, ring, peak),
+        other => Err(format!("formato de entrada: {other}")),
     }
 }
 
