@@ -1,0 +1,17 @@
+[package]
+name = "xy-pad"
+version = "0.1.0"
+edition = "2021"
+description = "Laptop touchpad as an XY MIDI pad (Linux evdev + virtual ALSA port)"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.32", default-features = true, features = ["wayland"] }
+egui = "0.32"
+evdev = "0.12"
+midir = "0.10"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
