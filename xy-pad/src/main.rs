@@ -236,7 +236,7 @@ fn pad_thread(shared: Arc<Shared>) {
                 shared.set_status(format!("pad read: {e}"));
                 thread::sleep(Duration::from_millis(50));
             }
-        }
+        };
         }
     }
 }
