@@ -246,7 +246,7 @@ impl eframe::App for HelixApp {
                     }
                 }
             }
-            if self.arp.whammy_on || self.arp.guitar_on {
+            if self.arp.whammy_on {
                 if let Some(out) = self.gt100.as_mut() {
                     out.refresh();
                     if let Err(e) = out.auto_connect() {
@@ -289,15 +289,12 @@ impl eframe::App for HelixApp {
         let active: HashSet<u8> = snap.active_notes.iter().copied().collect();
         let pooled: HashSet<u8> = snap.arp_pool.iter().copied().collect();
 
-        if let Some(out) = self.gt100.as_mut() {
-            let semis = if snap.whammy_on {
+        if snap.whammy_on {
+            if let Some(out) = self.gt100.as_mut() {
                 let i = snap.whammy_step.min(WHAMMY_SEQUENCE.len() - 1);
-                WHAMMY_SEQUENCE[i]
-            } else {
-                0
-            };
-            if let Err(e) = out.send_semitones(semis) {
-                self.gt100_err = Some(e);
+                if let Err(e) = out.send_semitones(WHAMMY_SEQUENCE[i]) {
+                    self.gt100_err = Some(e);
+                }
             }
         }
 

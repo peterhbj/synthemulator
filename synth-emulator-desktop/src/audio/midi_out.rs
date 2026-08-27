@@ -3,19 +3,20 @@ use midir::{MidiOutput, MidiOutputConnection};
 /// Roland DT1 for GT-100 TEMPORARY PATCH FX1 PS1:PITCH.
 ///
 /// Packet: `F0 41 <dev> 00 00 60 12  <addr 4>  <data>  <checksum>  F7`
-/// (GT-100 Ver.2 / vguitarforums). Device id `10`. Model `00 00 60`.
+/// Device id `10`. Model `00 00 60`.
 ///
-/// Address `00 00 02 37` is the sourced offset for FX1 PS1:PITCH. The
-/// MIDI Implementation PDF was not reachable from here; if pitch does
-/// not stick live, try TEMPORARY PATCH base `20 00 00 00` added in,
-/// i.e. `20 00 02 37`.
+/// GT-001 / GT-100 Ver.2 MIDI Implementation:
+/// TEMPORARY PATCH base `60 00 00 00` + Table PATCH offset
+/// `00 00 02 37` (FX1 PITCH SHIFTER PS1:PITCH) = `60 00 02 37`.
+/// Bare `00 00 02 37` is SYSTEM3 PREAMP B PRESENCE. `20 00 02 37` is
+/// a USER/PRESET slot, not the live patch.
 ///
 /// Data `00`..=`30` hex = -24..=+24 st. Bytes 12 / 24 / 36 (decimal)
 /// map to -12 / 0 / +12.
 pub const DEVICE_ID: u8 = 0x10;
 pub const MODEL_ID: [u8; 3] = [0x00, 0x00, 0x60];
 pub const DT1: u8 = 0x12;
-pub const PS1_PITCH_ADDR: [u8; 4] = [0x00, 0x00, 0x02, 0x37];
+pub const PS1_PITCH_ADDR: [u8; 4] = [0x60, 0x00, 0x02, 0x37];
 
 pub fn pitch_data_byte(semitones: i32) -> u8 {
     (semitones + 24).clamp(0, 48) as u8
@@ -56,16 +57,14 @@ pub struct Gt100Out {
 
 impl Gt100Out {
     pub fn new() -> Self {
-        let mut out = Self {
+        // Do not scan or send on boot. Connect only when Whammy turns on.
+        Self {
             conn: None,
             ports: Vec::new(),
             connected: None,
             hold_off: false,
             last_byte: None,
-        };
-        out.refresh();
-        let _ = out.auto_connect();
-        out
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -120,10 +119,8 @@ impl Gt100Out {
     }
 
     /// Send only when the data byte changes. Call from the UI thread.
+    /// Does not scan or connect: caller must already have a port.
     pub fn send_semitones(&mut self, semitones: i32) -> Result<(), String> {
-        if self.connected.is_none() && !self.hold_off {
-            self.auto_connect()?;
-        }
         let byte = pitch_data_byte(semitones);
         if self.last_byte == Some(byte) {
             return Ok(());
@@ -171,15 +168,16 @@ pub fn score_gt100_out(name: &str) -> i32 {
     if l.contains("yamaha") || l.contains("digital keyboard") {
         return -50;
     }
-    let mut s = 0;
-    if l.contains("gt-100") || l.contains("gt100") {
-        s += 80;
+    // Require the GT-100 name. "Boss" alone would match Katana/ME-80/etc.
+    if !(l.contains("gt-100") || l.contains("gt100")) {
+        return 0;
     }
+    let mut s = 80;
     if l.contains("boss") {
-        s += 50;
+        s += 10;
     }
     if l.contains("roland") {
-        s += 30;
+        s += 5;
     }
     s
 }
@@ -205,7 +203,7 @@ mod tests {
         assert_eq!(msg[2], 0x10);
         assert_eq!(&msg[3..6], &[0x00, 0x00, 0x60]);
         assert_eq!(msg[6], 0x12);
-        assert_eq!(&msg[7..11], &[0x00, 0x00, 0x02, 0x37]);
+        assert_eq!(&msg[7..11], &[0x60, 0x00, 0x02, 0x37]);
         assert_eq!(msg[11], 24);
         let cs = roland_checksum(&PS1_PITCH_ADDR, &[24]);
         assert_eq!(msg[12], cs);
@@ -237,5 +235,15 @@ mod tests {
     #[test]
     fn skips_yamaha_alone() {
         assert!(pick_gt100_out(&["Yamaha Digital Keyboard".into()]).is_none());
+    }
+
+    #[test]
+    fn skips_boss_without_gt100() {
+        assert!(pick_gt100_out(&["Boss Katana:MIDI 1".into(), "ME-80".into()]).is_none());
+    }
+
+    #[test]
+    fn address_is_temporary_patch_not_system() {
+        assert_eq!(PS1_PITCH_ADDR, [0x60, 0x00, 0x02, 0x37]);
     }
 }
