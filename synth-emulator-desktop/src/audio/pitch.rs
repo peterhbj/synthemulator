@@ -34,7 +34,6 @@ pub struct PitchShift {
     fft_fwd: Arc<dyn Fft<f32>>,
     fft_inv: Arc<dyn Fft<f32>>,
     ratio: f32,
-    shifting: bool,
     // Transient detector (highpass + dual envelope / flux-like onset).
     hp_z: f32,
     hp_c: f32,
@@ -48,7 +47,7 @@ pub struct PitchShift {
     bypass_fade: u32,
     refractory: u32,
     refractory_n: u32,
-    // Delay aligns dry pick with STFT latency (~fft_size samples).
+    // Delay aligns dry pick with OLA latency (fft_size - hop).
     dry_delay: Vec<f32>,
     gate_delay: Vec<f32>,
     delay_w: usize,
@@ -141,7 +140,6 @@ impl PitchShift {
             fft_fwd,
             fft_inv,
             ratio: 1.0,
-            shifting: false,
             hp_z: 0.0,
             // 1-pole LP coeff exp(-2π fc/sr); HP = x - lp. Pick band ~3.5 kHz.
             hp_c: (-TAU * 3500.0 / sample_rate).exp(),
@@ -155,10 +153,10 @@ impl PitchShift {
             bypass_fade,
             refractory: 0,
             refractory_n: (0.040 * sample_rate).round().max(1.0) as u32,
-            dry_delay: vec![0.0; fft_size],
-            gate_delay: vec![0.0; fft_size],
+            dry_delay: vec![0.0; fft_size - hop],
+            gate_delay: vec![0.0; fft_size - hop],
             delay_w: 0,
-            delay_len: fft_size,
+            delay_len: fft_size - hop,
             lp1,
             lp2,
         }
@@ -166,15 +164,10 @@ impl PitchShift {
 
     pub fn set_semitones(&mut self, semitones: f32) {
         self.ratio = 2f32.powf(semitones / 12.0).clamp(0.25, 4.0);
-        self.shifting = semitones.abs() > 0.1;
+        // Unison stays wet at ratio 1 so vocoder latency does not collapse.
     }
 
     pub fn process(&mut self, input: f32) -> f32 {
-        // Unity / true-bypass: no vocoder smear, no 11 kHz shelf.
-        if !self.shifting {
-            return input;
-        }
-
         let gate = self.tick_transient(input);
         let dry = self.dry_delay[self.delay_w];
         let g = self.gate_delay[self.delay_w];
@@ -479,9 +472,9 @@ mod tests {
             out.push(p.process(0.0));
         }
 
-        // Dry pick is delayed to STFT latency (~fft_size). Wide window so hop
+        // Dry pick is delayed to OLA latency (fft_size - hop). Wide window so hop
         // quantization cannot hide the burst.
-        let start = warmup + 4096 - 512;
+        let start = warmup + (4096 - 256) - 512;
         let region = &out[start..start + 2048];
         let energy: f32 = region.iter().map(|y| y * y).sum();
         let rms = (energy / region.len() as f32).sqrt();
@@ -491,4 +484,21 @@ mod tests {
             "expected pick attack energy, got rms={rms:.4}"
         );
     }
+
+    #[test]
+    fn unison_keeps_vocoder_latency() {
+        let sr = 48_000.0;
+        let mut p = PitchShift::new(sr);
+        p.set_semitones(-12.0);
+        for _ in 0..8192 {
+            let _ = p.process(0.1);
+        }
+        p.set_semitones(0.0);
+        let y = p.process(0.7);
+        assert!(
+            (y - 0.7).abs() > 0.2,
+            "unison dumped true-bypass; got {y} approx input"
+        );
+    }
 }
+
