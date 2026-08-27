@@ -6,6 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use evdev::{AbsoluteAxisType, Device, InputEventKind, Key};
+use midir::os::unix::VirtualOutput;
 use midir::{MidiOutput, MidiOutputConnection};
 
 use xy_pad::{cc_msg, map_axis, score_pad, CC_X, CC_Y};
