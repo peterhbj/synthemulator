@@ -13,24 +13,30 @@ use xy_pad::{cc_msg, map_axis, score_pad, CC_X, CC_Y};
 
 struct Shared {
     armed: AtomicBool,
+    grabbed: AtomicBool,
+    shutdown: AtomicBool,
     x: AtomicU8,
     y: AtomicU8,
     touching: AtomicBool,
     midi_ok: AtomicBool,
     pad_name: Mutex<String>,
     status: Mutex<String>,
+    device: Mutex<Option<Device>>,
 }
 
 impl Shared {
     fn new() -> Self {
         Self {
             armed: AtomicBool::new(false),
+            grabbed: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
             x: AtomicU8::new(64),
             y: AtomicU8::new(64),
             touching: AtomicBool::new(false),
             midi_ok: AtomicBool::new(false),
             pad_name: Mutex::new(String::from("(nenhum)")),
             status: Mutex::new(String::from("abrindo…")),
+            device: Mutex::new(None),
         }
     }
 
@@ -38,6 +44,23 @@ impl Shared {
         if let Ok(mut g) = self.status.lock() {
             *g = s.into();
         }
+    }
+
+    /// Immediate ungrab so Esc/close do not wait for the pad thread.
+    fn ungrab_now(&self) {
+        self.armed.store(false, Ordering::Relaxed);
+        if let Ok(mut g) = self.device.lock() {
+            if let Some(dev) = g.as_mut() {
+                let _ = dev.ungrab();
+            }
+        }
+        self.grabbed.store(false, Ordering::Relaxed);
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.ungrab_now();
+        self.set_status("mouse de volta");
     }
 }
 
@@ -94,7 +117,7 @@ fn poll_in(fd: i32, timeout_ms: i32) -> bool {
 }
 
 fn pad_thread(shared: Arc<Shared>) {
-    let (path, mut dev) = match pick_touchpad() {
+    let (path, dev) = match pick_touchpad() {
         Ok(v) => v,
         Err(e) => {
             shared.set_status(format!("pad: {e}"));
@@ -109,6 +132,10 @@ fn pad_thread(shared: Arc<Shared>) {
     let (xmin, xmax) = axis_range(&dev, AbsoluteAxisType::ABS_X);
     let (ymin, ymax) = axis_range(&dev, AbsoluteAxisType::ABS_Y);
 
+    if let Ok(mut g) = shared.device.lock() {
+        *g = Some(dev);
+    }
+
     let mut midi = match open_midi() {
         Ok(c) => {
             shared.midi_ok.store(true, Ordering::Relaxed);
@@ -120,29 +147,54 @@ fn pad_thread(shared: Arc<Shared>) {
         }
     };
 
-    let mut grabbed = false;
     let mut last_x = 255u8;
     let mut last_y = 255u8;
     let mut raw_x = (xmin + xmax) / 2;
     let mut raw_y = (ymin + ymax) / 2;
 
     loop {
-        let want = shared.armed.load(Ordering::Relaxed);
-        if want && !grabbed {
-            match dev.grab() {
-                Ok(()) => {
-                    grabbed = true;
-                    shared.set_status("pad armado (F8 desliga, Esc solta)");
-                }
-                Err(e) => shared.set_status(format!("grab falhou: {e}")),
-            }
-        } else if !want && grabbed {
-            let _ = dev.ungrab();
-            grabbed = false;
-            shared.set_status("mouse de volta");
+        if shared.shutdown.load(Ordering::Relaxed) {
+            shared.ungrab_now();
+            return;
         }
 
-        if poll_in(dev.as_raw_fd(), 8) {
+        let want = shared.armed.load(Ordering::Relaxed);
+        let fd = {
+            let mut g = match shared.device.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let Some(dev) = g.as_mut() else {
+                return;
+            };
+            let grabbed = shared.grabbed.load(Ordering::Relaxed);
+            if want && !grabbed {
+                match dev.grab() {
+                    Ok(()) => {
+                        shared.grabbed.store(true, Ordering::Relaxed);
+                        shared.set_status("pad armado (F8 desliga, Esc solta)");
+                    }
+                    Err(e) => shared.set_status(format!("grab falhou: {e}")),
+                }
+            } else if !want && grabbed {
+                let _ = dev.ungrab();
+                shared.grabbed.store(false, Ordering::Relaxed);
+                shared.set_status("mouse de volta");
+            }
+            dev.as_raw_fd()
+        };
+
+        if !poll_in(fd, 8) {
+            continue;
+        }
+
+        let mut g = match shared.device.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(dev) = g.as_mut() else {
+            return;
+        };
         match dev.fetch_events() {
             Ok(events) => {
                 let mut moved = false;
@@ -158,11 +210,8 @@ fn pad_thread(shared: Arc<Shared>) {
                             raw_y = ev.value();
                             moved = true;
                         }
-                        InputEventKind::Key(Key::BTN_TOUCH) | InputEventKind::Key(Key::BTN_TOOL_FINGER)
-                            => {
-                            shared
-                                .touching
-                                .store(ev.value() != 0, Ordering::Relaxed);
+                        InputEventKind::Key(Key::BTN_TOUCH) | InputEventKind::Key(Key::BTN_TOOL_FINGER) => {
+                            shared.touching.store(ev.value() != 0, Ordering::Relaxed);
                         }
                         _ => {}
                     }
@@ -172,7 +221,7 @@ fn pad_thread(shared: Arc<Shared>) {
                     let y = map_axis(raw_y, ymin, ymax, true);
                     shared.x.store(x, Ordering::Relaxed);
                     shared.y.store(y, Ordering::Relaxed);
-                    if grabbed && (x != last_x || y != last_y) {
+                    if shared.grabbed.load(Ordering::Relaxed) && (x != last_x || y != last_y) {
                         if let Some(conn) = midi.as_mut() {
                             let _ = conn.send(&cc_msg(CC_X, x));
                             let _ = conn.send(&cc_msg(CC_Y, y));
@@ -186,7 +235,6 @@ fn pad_thread(shared: Arc<Shared>) {
                 shared.set_status(format!("pad read: {e}"));
                 thread::sleep(Duration::from_millis(50));
             }
-        }
         }
     }
 }
@@ -213,10 +261,16 @@ fn hotkey_thread(shared: Arc<Shared>) {
         })
         .collect();
     if devices.is_empty() {
-        shared.set_status("teclado evdev não encontrado (F8/Esc)");
+        shared.set_status("teclado evdev não encontrado — use Esc na janela ou o botão");
+        while !shared.shutdown.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
         return;
     }
     loop {
+        if shared.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         for d in &mut devices {
             if !poll_in(d.as_raw_fd(), 0) {
                 continue;
@@ -234,7 +288,8 @@ fn hotkey_thread(shared: Arc<Shared>) {
                                     shared.armed.store(next, Ordering::Relaxed);
                                 }
                                 Key::KEY_ESC => {
-                                    shared.armed.store(false, Ordering::Relaxed);
+                                    shared.ungrab_now();
+                                    shared.set_status("mouse de volta");
                                 }
                                 _ => {}
                             }
@@ -255,6 +310,16 @@ struct Ui {
 impl eframe::App for Ui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(33));
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.shared.ungrab_now();
+            self.shared.set_status("mouse de volta");
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F8)) {
+            let next = !self.shared.armed.load(Ordering::Relaxed);
+            self.shared.armed.store(next, Ordering::Relaxed);
+        }
+
         let armed = self.shared.armed.load(Ordering::Relaxed);
         let x = self.shared.x.load(Ordering::Relaxed);
         let y = self.shared.y.load(Ordering::Relaxed);
@@ -295,7 +360,12 @@ impl eframe::App for Ui {
                 state,
             );
             if ui.button(if armed { "desarmar" } else { "armar" }).clicked() {
-                self.shared.armed.store(!armed, Ordering::Relaxed);
+                if armed {
+                    self.shared.ungrab_now();
+                    self.shared.set_status("mouse de volta");
+                } else {
+                    self.shared.armed.store(true, Ordering::Relaxed);
+                }
             }
             ui.label(format!(
                 "X {x:3}   Y {y:3}   {}",
@@ -323,6 +393,10 @@ impl eframe::App for Ui {
                 },
             );
         });
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shared.request_shutdown();
     }
 }
 
