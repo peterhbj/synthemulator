@@ -10,10 +10,10 @@ use super::theme::{self, BG, FG, MUTED, SUBTLE, SURFACE};
 use super::widgets::{
     badge_pill, format_hz, format_ms, format_pct, icon_button, knob, volume_slider, waveform_select,
 };
-use crate::audio::{AudioHost, GuitarInput, MidiHub};
+use crate::audio::{AudioHost, Gt100Out, GuitarInput, MidiHub};
 use crate::synth::{
     midi_to_name, notes_from_preset, octave_base_midi, ArpDivision, ArpPattern, ArpPresetId,
-    Command, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES,
+    Command, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES, WHAMMY_SEQUENCE,
 };
 
 pub struct HelixApp {
@@ -23,6 +23,8 @@ pub struct HelixApp {
     midi_err: Option<String>,
     guitar: Option<GuitarInput>,
     guitar_err: Option<String>,
+    gt100: Option<Gt100Out>,
+    gt100_err: Option<String>,
     params: SynthParams,
     octave: i32,
     bend: f32,
@@ -48,7 +50,7 @@ impl HelixApp {
             o.zoom_with_keyboard = false;
         });
 
-        let (audio, audio_err, midi, guitar) = match AudioHost::start() {
+        let (audio, audio_err, midi, guitar, gt100) = match AudioHost::start() {
             Ok(host) => {
                 let midi = MidiHub::new(host.sender());
                 let guitar = GuitarInput::new(
@@ -56,9 +58,10 @@ impl HelixApp {
                     host.guitar_peak.clone(),
                     host.sample_rate,
                 );
-                (Some(host), None, Some(midi), Some(guitar))
+                let gt100 = Gt100Out::new();
+                (Some(host), None, Some(midi), Some(guitar), Some(gt100))
             }
-            Err(e) => (None, Some(e), None, None),
+            Err(e) => (None, Some(e), None, None, None),
         };
 
         Self {
@@ -68,6 +71,8 @@ impl HelixApp {
             midi_err: None,
             guitar,
             guitar_err: None,
+            gt100,
+            gt100_err: None,
             params: SynthParams::default(),
             octave: 3,
             bend: 0.0,
@@ -241,6 +246,14 @@ impl eframe::App for HelixApp {
                     }
                 }
             }
+            if self.arp.whammy_on {
+                if let Some(out) = self.gt100.as_mut() {
+                    out.refresh();
+                    if let Err(e) = out.auto_connect() {
+                        self.gt100_err = Some(e);
+                    }
+                }
+            }
         }
 
         if self.was_dragging_bend && !self.dragging_bend {
@@ -275,6 +288,15 @@ impl eframe::App for HelixApp {
         }
         let active: HashSet<u8> = snap.active_notes.iter().copied().collect();
         let pooled: HashSet<u8> = snap.arp_pool.iter().copied().collect();
+
+        if snap.whammy_on {
+            if let Some(out) = self.gt100.as_mut() {
+                let i = snap.whammy_step.min(WHAMMY_SEQUENCE.len() - 1);
+                if let Err(e) = out.send_semitones(WHAMMY_SEQUENCE[i]) {
+                    self.gt100_err = Some(e);
+                }
+            }
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -463,6 +485,10 @@ impl HelixApp {
                 if let Some(err) = &self.guitar_err {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), err);
                 }
+                gt100_out_picker(ui, self);
+                if let Some(err) = &self.gt100_err {
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
 
                 ui.add_space(6.0);
                 ui.separator();
@@ -545,7 +571,7 @@ impl HelixApp {
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new(
-                "Whammy loops the Map of the Problematique octave pattern (−1 / 0 / +1) on 16ths. Pair it with a loop and twist the filter. Latch holds your chord. Drag the bend wheel or hold up/down arrows. Z and Q rows play notes, Space sustains, [ ] shifts octave, Esc silences all. MIDI USB: notes, sustain, pitch bend.",
+                "Whammy drives the GT-100 Pitch Shifter over SysEx DT1 (octaves -12 / 0 / +12 on 16ths). Helix passes USB guitar dry. Pair it with a loop and twist the filter. Latch holds your chord. Drag the bend wheel or hold up/down arrows. Z and Q rows play notes, Space sustains, [ ] shifts octave, Esc silences all. MIDI USB in: notes, sustain, pitch bend.",
             )
             .size(12.0)
             .color(MUTED),
@@ -575,6 +601,23 @@ impl HelixApp {
             ArpEvent::ToggleWhammy => {
                 self.arp.whammy_on = !self.arp.whammy_on;
                 self.send(Command::SetWhammyOn(self.arp.whammy_on));
+                if self.arp.whammy_on {
+                    if let Some(out) = self.gt100.as_mut() {
+                        out.hold_off = false;
+                        match out.auto_connect() {
+                            Ok(()) => self.gt100_err = None,
+                            Err(e) => self.gt100_err = Some(e),
+                        }
+                        if out.connected.is_none() {
+                            self.gt100_err = Some(
+                                "Plugue a GT-100 USB MIDI out (nao o Yamaha) e ligue Whammy."
+                                    .into(),
+                            );
+                        }
+                    }
+                } else if let Some(out) = self.gt100.as_mut() {
+                    let _ = out.send_semitones(0);
+                }
             }
             ArpEvent::ToggleGuitar => {
                 self.arp.guitar_on = !self.arp.guitar_on;
@@ -682,7 +725,52 @@ fn guitar_in_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
     });
 }
 
+fn gt100_out_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
+    let Some(out) = app.gt100.as_mut() else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label(theme::section_label("GT-100 MIDI OUT"));
+        let label = out
+            .connected
+            .as_deref()
+            .map(short_midi_name)
+            .unwrap_or_else(|| "GT-100 out".to_string());
+        egui::ComboBox::from_id_salt("gt100-out")
+            .selected_text(egui::RichText::new(label).size(12.0).color(FG))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(out.connected.is_none(), "None")
+                    .clicked()
+                {
+                    out.disconnect();
+                }
+                let ports = out.ports.clone();
+                if ports.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Nenhuma porta MIDI out. Plugue a GT-100 USB.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+                for name in ports {
+                    let selected = out.connected.as_deref() == Some(name.as_str());
+                    if ui
+                        .selectable_label(selected, short_midi_name(&name))
+                        .clicked()
+                    {
+                        match out.connect(&name) {
+                            Ok(()) => app.gt100_err = None,
+                            Err(e) => app.gt100_err = Some(e),
+                        }
+                    }
+                }
+            });
+    });
+}
+
 fn midi_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
+
     let Some(midi) = app.midi.as_mut() else {
         ui.label(egui::RichText::new("No MIDI").color(SUBTLE));
         return;
