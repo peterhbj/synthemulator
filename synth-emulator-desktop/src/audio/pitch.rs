@@ -8,6 +8,10 @@ use rustfft::{Fft, FftPlanner};
 ///
 /// Chords stay in interval: every partial moves by the same ratio. This replaces
 /// the delay-line harmonizer, which tore polyphonic guitar into inharmonic junk.
+///
+/// Drop-like extras (still mono / not hexaphonic):
+/// - pick-attack bypass: a short unshifted burst so the vocoder does not smear the pick
+/// - ~11 kHz lowpass on the shifted path only (Drop: 20 Hz–11 kHz with effect on)
 pub struct PitchShift {
     fft_size: usize,
     hop: usize,
@@ -30,6 +34,68 @@ pub struct PitchShift {
     fft_fwd: Arc<dyn Fft<f32>>,
     fft_inv: Arc<dyn Fft<f32>>,
     ratio: f32,
+    // Transient detector (highpass + dual envelope / flux-like onset).
+    hp_z: f32,
+    hp_c: f32,
+    env_fast: f32,
+    env_slow: f32,
+    atk_c: f32,
+    rel_c: f32,
+    slow_c: f32,
+    bypass_left: u32,
+    bypass_total: u32,
+    bypass_fade: u32,
+    refractory: u32,
+    refractory_n: u32,
+    // Delay aligns dry pick with OLA latency (fft_size - hop).
+    dry_delay: Vec<f32>,
+    gate_delay: Vec<f32>,
+    delay_w: usize,
+    delay_len: usize,
+    // 4th-order Butterworth ~11 kHz, wet path only.
+    lp1: Biquad,
+    lp2: Biquad,
+}
+
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+impl Biquad {
+    /// RBJ lowpass. `q` is the per-section Butterworth Q.
+    fn lowpass(sr: f32, fc: f32, q: f32) -> Self {
+        let nyq = sr * 0.45;
+        let w0 = TAU * (fc.clamp(20.0, nyq) / sr);
+        let cosw = w0.cos();
+        let alpha = w0.sin() / (2.0 * q.max(0.05));
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: ((1.0 - cosw) * 0.5) / a0,
+            b1: (1.0 - cosw) / a0,
+            b2: ((1.0 - cosw) * 0.5) / a0,
+            a1: (-2.0 * cosw) / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    fn tick(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+fn one_pole_coeff(time_s: f32, sr: f32) -> f32 {
+    (-1.0 / (time_s * sr).max(1.0)).exp()
 }
 
 impl PitchShift {
@@ -37,7 +103,8 @@ impl PitchShift {
         // 4096 @ 48 kHz → 11.7 Hz/bin. Needed so −12 on C3 (~65 Hz) doesn't
         // collapse into the next chord tone.
         let fft_size = 4096;
-        let osamp = 8usize;
+        // Hop N/16: less granular than osamp=8, still COLA-safe with Hann.
+        let osamp = 16usize;
         let hop = fft_size / osamp;
         let bins = fft_size / 2 + 1;
         let mut planner = FftPlanner::<f32>::new();
@@ -46,6 +113,11 @@ impl PitchShift {
         let window: Vec<f32> = (0..fft_size)
             .map(|i| 0.5 - 0.5 * (TAU * i as f32 / fft_size as f32).cos())
             .collect();
+        // Butterworth 4th-order section Qs (lower Q first).
+        let lp1 = Biquad::lowpass(sample_rate, 11_000.0, 0.5411961);
+        let lp2 = Biquad::lowpass(sample_rate, 11_000.0, 1.3065630);
+        let bypass_total = (0.012 * sample_rate).round().max(1.0) as u32;
+        let bypass_fade = (0.006 * sample_rate).round().max(1.0) as u32;
         Self {
             fft_size,
             hop,
@@ -68,14 +140,86 @@ impl PitchShift {
             fft_fwd,
             fft_inv,
             ratio: 1.0,
+            hp_z: 0.0,
+            // 1-pole LP coeff exp(-2π fc/sr); HP = x - lp. Pick band ~3.5 kHz.
+            hp_c: (-TAU * 3500.0 / sample_rate).exp(),
+            env_fast: 0.0,
+            env_slow: 0.0,
+            atk_c: one_pole_coeff(0.0004, sample_rate),
+            rel_c: one_pole_coeff(0.025, sample_rate),
+            slow_c: one_pole_coeff(0.080, sample_rate),
+            bypass_left: 0,
+            bypass_total,
+            bypass_fade,
+            refractory: 0,
+            refractory_n: (0.040 * sample_rate).round().max(1.0) as u32,
+            dry_delay: vec![0.0; fft_size - hop],
+            gate_delay: vec![0.0; fft_size - hop],
+            delay_w: 0,
+            delay_len: fft_size - hop,
+            lp1,
+            lp2,
         }
     }
 
     pub fn set_semitones(&mut self, semitones: f32) {
         self.ratio = 2f32.powf(semitones / 12.0).clamp(0.25, 4.0);
+        // Unison stays wet at ratio 1 so vocoder latency does not collapse.
     }
 
     pub fn process(&mut self, input: f32) -> f32 {
+        let gate = self.tick_transient(input);
+        let dry = self.dry_delay[self.delay_w];
+        let g = self.gate_delay[self.delay_w];
+        self.dry_delay[self.delay_w] = input;
+        self.gate_delay[self.delay_w] = gate;
+        self.delay_w = (self.delay_w + 1) % self.delay_len;
+
+        let wet = self.process_shifted(input);
+        let wet = self.lp2.tick(self.lp1.tick(wet));
+        (wet * (1.0 - g) + dry * g).clamp(-1.0, 1.0)
+    }
+
+    fn tick_transient(&mut self, input: f32) -> f32 {
+        // 1-pole highpass ~3.5 kHz emphasises pick noise vs string body.
+        self.hp_z = input + self.hp_c * (self.hp_z - input);
+        let hp = input - self.hp_z;
+        let abs = hp.abs();
+        let fast_c = if abs > self.env_fast {
+            self.atk_c
+        } else {
+            self.rel_c
+        };
+        self.env_fast = abs + fast_c * (self.env_fast - abs);
+        self.env_slow = abs + self.slow_c * (self.env_slow - abs);
+
+        // Dual-envelope onset ≈ spectral flux: fast HF jumps vs a slow floor.
+        // Refractory stops chord beating from retriggering dry-through.
+        const FLOOR: f32 = 0.04;
+        const RATIO: f32 = 4.0;
+        let can_fire = self.refractory == 0;
+        let attack =
+            can_fire && self.env_fast > FLOOR && self.env_fast > self.env_slow * RATIO;
+        if attack {
+            self.bypass_left = self.bypass_total;
+            self.refractory = self.refractory_n;
+        } else if self.refractory > 0 {
+            self.refractory -= 1;
+        }
+        if self.bypass_left == 0 {
+            return 0.0;
+        }
+        let g = if self.bypass_left > self.bypass_fade {
+            1.0
+        } else {
+            let t = self.bypass_left as f32 / self.bypass_fade as f32;
+            0.5 * (1.0 + (PI * (1.0 - t)).cos())
+        };
+        self.bypass_left -= 1;
+        g
+    }
+
+    fn process_shifted(&mut self, input: f32) -> f32 {
         self.hist[self.hist_w] = input;
         self.hist_w = (self.hist_w + 1) % self.fft_size;
         self.hop_count += 1;
@@ -87,7 +231,7 @@ impl PitchShift {
         if self.out_qi < self.hop {
             let y = self.out_q[self.out_qi];
             self.out_qi += 1;
-            y.clamp(-1.0, 1.0)
+            y
         } else {
             0.0
         }
@@ -305,4 +449,56 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn transients_produce_energy() {
+        let sr = 48_000.0;
+        let mut p = PitchShift::new(sr);
+        p.set_semitones(-12.0);
+
+        let warmup = 8192;
+        let burst_n = (sr * 0.002) as usize; // 2 ms pick click
+        let tail = 12_000;
+        let mut out = Vec::with_capacity(warmup + burst_n + tail);
+
+        for _ in 0..warmup {
+            out.push(p.process(0.0));
+        }
+        for i in 0..burst_n {
+            let x = if i % 2 == 0 { 0.9 } else { -0.9 };
+            out.push(p.process(x));
+        }
+        for _ in 0..tail {
+            out.push(p.process(0.0));
+        }
+
+        // Dry pick is delayed to OLA latency (fft_size - hop). Wide window so hop
+        // quantization cannot hide the burst.
+        let start = warmup + (4096 - 256) - 512;
+        let region = &out[start..start + 2048];
+        let energy: f32 = region.iter().map(|y| y * y).sum();
+        let rms = (energy / region.len() as f32).sqrt();
+        eprintln!("transient rms (post-latency): {rms:.4}");
+        assert!(
+            rms > 0.05,
+            "expected pick attack energy, got rms={rms:.4}"
+        );
+    }
+
+    #[test]
+    fn unison_keeps_vocoder_latency() {
+        let sr = 48_000.0;
+        let mut p = PitchShift::new(sr);
+        p.set_semitones(-12.0);
+        for _ in 0..8192 {
+            let _ = p.process(0.1);
+        }
+        p.set_semitones(0.0);
+        let y = p.process(0.7);
+        assert!(
+            (y - 0.7).abs() > 0.2,
+            "unison dumped true-bypass; got {y} approx input"
+        );
+    }
 }
+
