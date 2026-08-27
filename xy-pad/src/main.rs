@@ -48,13 +48,16 @@ impl Shared {
 
     /// Immediate ungrab so Esc/close do not wait for the pad thread.
     fn ungrab_now(&self) {
-        self.armed.store(false, Ordering::Relaxed);
         if let Ok(mut g) = self.device.lock() {
+            self.armed.store(false, Ordering::Relaxed);
             if let Some(dev) = g.as_mut() {
                 let _ = dev.ungrab();
             }
+            self.grabbed.store(false, Ordering::Relaxed);
+        } else {
+            self.armed.store(false, Ordering::Relaxed);
+            self.grabbed.store(false, Ordering::Relaxed);
         }
-        self.grabbed.store(false, Ordering::Relaxed);
     }
 
     fn request_shutdown(&self) {
@@ -158,7 +161,6 @@ fn pad_thread(shared: Arc<Shared>) {
             return;
         }
 
-        let want = shared.armed.load(Ordering::Relaxed);
         let fd = {
             let mut g = match shared.device.lock() {
                 Ok(g) => g,
@@ -167,6 +169,7 @@ fn pad_thread(shared: Arc<Shared>) {
             let Some(dev) = g.as_mut() else {
                 return;
             };
+            let want = shared.armed.load(Ordering::Relaxed);
             let grabbed = shared.grabbed.load(Ordering::Relaxed);
             if want && !grabbed {
                 match dev.grab() {
@@ -317,11 +320,6 @@ impl eframe::App for Ui {
             self.shared.ungrab_now();
             self.shared.set_status("mouse de volta");
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F8)) {
-            let next = !self.shared.armed.load(Ordering::Relaxed);
-            self.shared.armed.store(next, Ordering::Relaxed);
-        }
-
         let armed = self.shared.armed.load(Ordering::Relaxed);
         let x = self.shared.x.load(Ordering::Relaxed);
         let y = self.shared.y.load(Ordering::Relaxed);
