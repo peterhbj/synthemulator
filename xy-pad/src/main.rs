@@ -188,6 +188,7 @@ fn pad_thread(shared: Arc<Shared>) {
             continue;
         }
 
+        {
         let mut g = match shared.device.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -235,6 +236,7 @@ fn pad_thread(shared: Arc<Shared>) {
                 shared.set_status(format!("pad read: {e}"));
                 thread::sleep(Duration::from_millis(50));
             }
+        }
         }
     }
 }
