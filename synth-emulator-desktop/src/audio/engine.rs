@@ -7,7 +7,6 @@ use crate::synth::{
 };
 
 use super::osc;
-use super::pitch::PitchShift;
 use super::ring::AudioRing;
 use std::sync::Arc;
 
@@ -222,7 +221,6 @@ pub struct Engine {
     guitar_ring: Arc<AudioRing>,
     guitar_on: bool,
     guitar_gain: f32,
-    guitar_shifter: PitchShift,
     guitar_level: f32,
 }
 
@@ -273,7 +271,6 @@ impl Engine {
             guitar_ring,
             guitar_on: false,
             guitar_gain: 0.85,
-            guitar_shifter: PitchShift::new(sample_rate),
             guitar_level: 0.0,
             params,
         }
@@ -660,13 +657,8 @@ impl Engine {
         let g_in = self.guitar_ring.pop().unwrap_or(0.0);
         self.guitar_level = self.guitar_level * 0.995 + g_in.abs() * 0.005;
         if self.guitar_on {
-            let shifted = if self.whammy_on {
-                self.guitar_shifter.set_semitones(self.octave_shift);
-                self.guitar_shifter.process(g_in)
-            } else {
-                g_in
-            };
-            mix += shifted * self.guitar_gain;
+            // Pitch is applied on the GT-100 via SysEx DT1 (midi_out.rs).
+            mix += g_in * self.guitar_gain;
         }
         self.voices
             .retain(|v| !(matches!(v.stage, EnvStage::Release) && v.gain <= 0.00012));
