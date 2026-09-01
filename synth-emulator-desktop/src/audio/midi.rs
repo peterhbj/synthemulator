@@ -7,6 +7,8 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 
 use crate::synth::Command;
 
+use super::midi_out::{pick_gt100_out, score_gt100_out};
+
 pub struct MidiHub {
     tx: Sender<Command>,
     pub ports: Vec<String>,
@@ -113,6 +115,100 @@ impl MidiHub {
     }
 }
 
+/// Second MIDI input: GT-100 USB port (same pick as `Gt100Out`).
+/// Yamaha stays on `MidiHub`. CC#80 (CTL1) → Whammy on/off.
+pub struct Gt100In {
+    tx: Sender<Command>,
+    pub ports: Vec<String>,
+    pub connected: Option<String>,
+    /// User picked "None" — don't auto-grab until they choose a port.
+    pub hold_off: bool,
+    _conn: Option<MidiInputConnection<Gt100Callback>>,
+}
+
+struct Gt100Callback {
+    tx: Sender<Command>,
+    parser: MidiParser,
+}
+
+impl Gt100In {
+    pub fn new(tx: Sender<Command>) -> Self {
+        let mut hub = Self {
+            tx,
+            ports: Vec::new(),
+            connected: None,
+            hold_off: false,
+            _conn: None,
+        };
+        hub.refresh();
+        let _ = hub.auto_connect();
+        hub
+    }
+
+    pub fn refresh(&mut self) {
+        self.ports = scan_ports();
+        if let Some(name) = &self.connected {
+            if !self.ports.iter().any(|p| p == name) {
+                self.disconnect_silent();
+            }
+        }
+    }
+
+    pub fn disconnect(&mut self) {
+        self.hold_off = true;
+        self.disconnect_silent();
+    }
+
+    fn disconnect_silent(&mut self) {
+        // Do not Panic: this port is only CTL, not the keyboard.
+        self._conn = None;
+        self.connected = None;
+    }
+
+    pub fn connect(&mut self, name: &str) -> Result<(), String> {
+        self.hold_off = false;
+        self._conn = None;
+        self.connected = None;
+        let mut midi_in =
+            MidiInput::new("helix-gt100-in").map_err(|e| format!("midi input: {e}"))?;
+        midi_in.ignore(Ignore::None);
+        let port = midi_in
+            .ports()
+            .into_iter()
+            .find(|p| midi_in.port_name(p).ok().as_deref() == Some(name))
+            .ok_or_else(|| format!("porta MIDI não encontrada: {name}"))?;
+        let tx = self.tx.clone();
+        let conn = midi_in
+            .connect(
+                &port,
+                "helix-gt100-ctrl",
+                move |_stamp, message, cb: &mut Gt100Callback| {
+                    cb.parser.feed(message, &cb.tx);
+                },
+                Gt100Callback {
+                    tx,
+                    parser: MidiParser::gt100_ctrl(),
+                },
+            )
+            .map_err(|e| format!("midi connect: {e}"))?;
+        self.connected = Some(name.to_string());
+        self._conn = Some(conn);
+        Ok(())
+    }
+
+    pub fn auto_connect(&mut self) -> Result<(), String> {
+        if self.hold_off || self.connected.is_some() {
+            return Ok(());
+        }
+        self.ports = scan_ports();
+        if let Some(name) = pick_gt100_out(&self.ports) {
+            self.connect(&name)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 fn scan_ports() -> Vec<String> {
     let Ok(mut midi_in) = MidiInput::new("helix-scan") else {
         return Vec::new();
@@ -129,6 +225,10 @@ fn pick_hardware_port(ports: &[String]) -> Option<String> {
     let scored = |name: &str| -> i32 {
         let l = name.to_ascii_lowercase();
         if is_virtual_port(&l) {
+            return -100;
+        }
+        // GT-100 USB is reserved for Gt100In (CTL) / Gt100Out (SysEx).
+        if score_gt100_out(name) >= 40 {
             return -100;
         }
         let mut score = 10;
@@ -174,6 +274,7 @@ struct MidiParser {
     data: [u8; 2],
     got: usize,
     in_sysex: bool,
+    decode: fn(u8, [u8; 2]) -> Option<Command>,
 }
 
 impl MidiParser {
@@ -183,6 +284,17 @@ impl MidiParser {
             data: [0; 2],
             got: 0,
             in_sysex: false,
+            decode,
+        }
+    }
+
+    fn gt100_ctrl() -> Self {
+        Self {
+            status: 0,
+            data: [0; 2],
+            got: 0,
+            in_sysex: false,
+            decode: decode_gt100_ctrl,
         }
     }
 
@@ -242,7 +354,7 @@ impl MidiParser {
             return false;
         }
         self.got = 0;
-        if let Some(cmd) = decode(self.status, self.data) {
+        if let Some(cmd) = (self.decode)(self.status, self.data) {
             let _ = tx.try_send(cmd);
             return true;
         }
@@ -276,6 +388,7 @@ fn decode(status: u8, data: [u8; 2]) -> Option<Command> {
         0xB0 => match data[0] {
             64 => Some(Command::SetPedal(data[1] >= 64)),
             120 | 123 => Some(Command::Panic),
+            // CC#80 (GT-100 CTL1) is decoded only on Gt100In.
             _ => None,
         },
         0xE0 => {
@@ -290,20 +403,35 @@ fn decode(status: u8, data: [u8; 2]) -> Option<Command> {
     }
 }
 
+/// GT-100 CTL1 is typically assigned to CC#80. Momentary: hold ≥64 = on.
+fn decode_gt100_ctrl(status: u8, data: [u8; 2]) -> Option<Command> {
+    match status & 0xF0 {
+        0xB0 if data[0] == 80 => Some(Command::SetWhammyOn(data[1] >= 64)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::bounded;
 
-    fn collect(bytes: &[u8]) -> Vec<Command> {
+    fn collect_with(mut p: MidiParser, bytes: &[u8]) -> Vec<Command> {
         let (tx, rx) = bounded(32);
-        let mut p = MidiParser::new();
         p.feed(bytes, &tx);
         let mut out = Vec::new();
         while let Ok(c) = rx.try_recv() {
             out.push(c);
         }
         out
+    }
+
+    fn collect(bytes: &[u8]) -> Vec<Command> {
+        collect_with(MidiParser::new(), bytes)
+    }
+
+    fn collect_gt100(bytes: &[u8]) -> Vec<Command> {
+        collect_with(MidiParser::gt100_ctrl(), bytes)
     }
 
     #[test]
@@ -343,5 +471,48 @@ mod tests {
         ])
         .unwrap()
         .contains("Digital Keyboard"));
+    }
+
+    #[test]
+    fn yamaha_hub_skips_gt100() {
+        assert!(pick_hardware_port(&[
+            "GT-100:GT-100 MIDI 1 24:0".into(),
+            "Digital Keyboard:Digital Keyboard MIDI 1 20:0".into(),
+        ])
+        .unwrap()
+        .contains("Digital Keyboard"));
+        assert!(pick_hardware_port(&["GT-100:GT-100 MIDI 1 24:0".into()]).is_none());
+    }
+
+    #[test]
+    fn yamaha_cc64_is_pedal_cc80_ignored() {
+        let cmds = collect(&[0xB0, 64, 127, 0xB0, 80, 127]);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::SetPedal(true)));
+    }
+
+    #[test]
+    fn gt100_cc80_whammy_on() {
+        let cmds = collect_gt100(&[0xB0, 80, 127]);
+        assert!(matches!(cmds[0], Command::SetWhammyOn(true)));
+    }
+
+    #[test]
+    fn gt100_cc80_whammy_off() {
+        let cmds = collect_gt100(&[0xB0, 80, 0]);
+        assert!(matches!(cmds[0], Command::SetWhammyOn(false)));
+    }
+
+    #[test]
+    fn gt100_cc80_threshold_and_running_status() {
+        let cmds = collect_gt100(&[0xB0, 80, 64, 80, 63]);
+        assert!(matches!(cmds[0], Command::SetWhammyOn(true)));
+        assert!(matches!(cmds[1], Command::SetWhammyOn(false)));
+    }
+
+    #[test]
+    fn gt100_ignores_sustain_and_notes() {
+        let cmds = collect_gt100(&[0xB0, 64, 127, 0x90, 60, 100]);
+        assert!(cmds.is_empty());
     }
 }
