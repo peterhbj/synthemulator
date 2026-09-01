@@ -41,6 +41,8 @@ pub struct HelixApp {
     peak: f32,
     was_dragging_bend: bool,
     midi_poll_at: f64,
+    /// UI just sent SetWhammyOn; ignore stale snapshot until engine matches.
+    whammy_cmd_pending: bool,
 }
 
 impl HelixApp {
@@ -112,6 +114,7 @@ impl HelixApp {
             peak: 0.0,
             was_dragging_bend: false,
             midi_poll_at: 0.0,
+            whammy_cmd_pending: false,
         }
     }
 
@@ -271,7 +274,10 @@ impl eframe::App for HelixApp {
             .as_ref()
             .map(|a| a.snapshot().whammy_on)
             .unwrap_or(false);
-        if snap_whammy != self.arp.whammy_on {
+        if snap_whammy == self.arp.whammy_on {
+            self.whammy_cmd_pending = false;
+        } else if !self.whammy_cmd_pending {
+            // CTL (or any engine-side change) — badge + Gt100Out follow the engine.
             self.set_whammy_ui(snap_whammy);
         }
 
@@ -658,6 +664,7 @@ impl HelixApp {
                 let on = !self.arp.whammy_on;
                 self.send(Command::SetWhammyOn(on));
                 self.set_whammy_ui(on);
+                self.whammy_cmd_pending = true;
             }
             ArpEvent::ToggleGuitar => {
                 self.arp.guitar_on = !self.arp.guitar_on;
