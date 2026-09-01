@@ -10,7 +10,7 @@ use super::theme::{self, BG, FG, MUTED, SUBTLE, SURFACE};
 use super::widgets::{
     badge_pill, format_hz, format_ms, format_pct, icon_button, knob, volume_slider, waveform_select,
 };
-use crate::audio::{AudioHost, Gt100Out, GuitarInput, MidiHub};
+use crate::audio::{AudioHost, Gt100In, Gt100Out, GuitarInput, MidiHub};
 use crate::synth::{
     midi_to_name, notes_from_preset, octave_base_midi, ArpDivision, ArpPattern, ArpPresetId,
     Command, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES, WHAMMY_SEQUENCE,
@@ -25,6 +25,8 @@ pub struct HelixApp {
     guitar_err: Option<String>,
     gt100: Option<Gt100Out>,
     gt100_err: Option<String>,
+    gt100_in: Option<Gt100In>,
+    gt100_in_err: Option<String>,
     params: SynthParams,
     octave: i32,
     bend: f32,
@@ -50,7 +52,7 @@ impl HelixApp {
             o.zoom_with_keyboard = false;
         });
 
-        let (audio, audio_err, midi, guitar, gt100) = match AudioHost::start() {
+        let (audio, audio_err, midi, guitar, gt100, gt100_in) = match AudioHost::start() {
             Ok(host) => {
                 let midi = MidiHub::new(host.sender());
                 let guitar = GuitarInput::new(
@@ -59,9 +61,17 @@ impl HelixApp {
                     host.sample_rate,
                 );
                 let gt100 = Gt100Out::new();
-                (Some(host), None, Some(midi), Some(guitar), Some(gt100))
+                let gt100_in = Gt100In::new(host.sender());
+                (
+                    Some(host),
+                    None,
+                    Some(midi),
+                    Some(guitar),
+                    Some(gt100),
+                    Some(gt100_in),
+                )
             }
-            Err(e) => (None, Some(e), None, None, None),
+            Err(e) => (None, Some(e), None, None, None, None),
         };
 
         Self {
@@ -73,6 +83,8 @@ impl HelixApp {
             guitar_err: None,
             gt100,
             gt100_err: None,
+            gt100_in,
+            gt100_in_err: None,
             params: SynthParams::default(),
             octave: 3,
             bend: 0.0,
@@ -222,12 +234,46 @@ impl HelixApp {
             }
         }
     }
+
+    /// Keep the badge / GT-100 out poll in sync with the engine (UI or CTL).
+    fn set_whammy_ui(&mut self, on: bool) {
+        self.arp.whammy_on = on;
+        if on {
+            self.connect_gt100_out();
+        } else if let Some(out) = self.gt100.as_mut() {
+            let _ = out.send_semitones(0);
+        }
+    }
+
+    fn connect_gt100_out(&mut self) {
+        if let Some(out) = self.gt100.as_mut() {
+            out.hold_off = false;
+            match out.auto_connect() {
+                Ok(()) => self.gt100_err = None,
+                Err(e) => self.gt100_err = Some(e),
+            }
+            if out.connected.is_none() {
+                self.gt100_err = Some(
+                    "Plugue a GT-100 USB MIDI out (nao o Yamaha) e ligue Whammy.".into(),
+                );
+            }
+        }
+    }
 }
 
 impl eframe::App for HelixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
         self.handle_keys(ctx);
+
+        let snap_whammy = self
+            .audio
+            .as_ref()
+            .map(|a| a.snapshot().whammy_on)
+            .unwrap_or(false);
+        if snap_whammy != self.arp.whammy_on {
+            self.set_whammy_ui(snap_whammy);
+        }
 
         let now = ctx.input(|i| i.time);
         if now - self.midi_poll_at > 0.8 {
@@ -236,6 +282,13 @@ impl eframe::App for HelixApp {
                 midi.refresh();
                 if let Err(e) = midi.auto_connect() {
                     self.midi_err = Some(e);
+                }
+            }
+            if let Some(ctrl) = self.gt100_in.as_mut() {
+                ctrl.refresh();
+                match ctrl.auto_connect() {
+                    Ok(()) => self.gt100_in_err = None,
+                    Err(e) => self.gt100_in_err = Some(e),
                 }
             }
             if self.arp.guitar_on {
@@ -489,6 +542,9 @@ impl HelixApp {
                 if let Some(err) = &self.gt100_err {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), err);
                 }
+                if let Some(err) = &self.gt100_in_err {
+                    ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
 
                 ui.add_space(6.0);
                 ui.separator();
@@ -571,7 +627,7 @@ impl HelixApp {
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new(
-                "Whammy drives the GT-100 Pitch Shifter over SysEx DT1 (octaves -12 / 0 / +12 on 16ths). Helix passes USB guitar dry. Pair it with a loop and twist the filter. Latch holds your chord. Drag the bend wheel or hold up/down arrows. Z and Q rows play notes, Space sustains, [ ] shifts octave, Esc silences all. MIDI USB in: notes, sustain, pitch bend.",
+                "Whammy drives the GT-100 Pitch Shifter over SysEx DT1 (octaves -12 / 0 / +12 on 16ths). Helix passes USB guitar dry. Pair it with a loop and twist the filter. Latch holds your chord. Drag the bend wheel or hold up/down arrows. Z and Q rows play notes, Space sustains, [ ] shifts octave, Esc silences all. MIDI USB in: notes, sustain, pitch bend. CTL1 / CC#80 on the GT-100 USB MIDI port toggles Whammy.",
             )
             .size(12.0)
             .color(MUTED),
@@ -599,25 +655,9 @@ impl HelixApp {
                 self.send(Command::ClearArp);
             }
             ArpEvent::ToggleWhammy => {
-                self.arp.whammy_on = !self.arp.whammy_on;
-                self.send(Command::SetWhammyOn(self.arp.whammy_on));
-                if self.arp.whammy_on {
-                    if let Some(out) = self.gt100.as_mut() {
-                        out.hold_off = false;
-                        match out.auto_connect() {
-                            Ok(()) => self.gt100_err = None,
-                            Err(e) => self.gt100_err = Some(e),
-                        }
-                        if out.connected.is_none() {
-                            self.gt100_err = Some(
-                                "Plugue a GT-100 USB MIDI out (nao o Yamaha) e ligue Whammy."
-                                    .into(),
-                            );
-                        }
-                    }
-                } else if let Some(out) = self.gt100.as_mut() {
-                    let _ = out.send_semitones(0);
-                }
+                let on = !self.arp.whammy_on;
+                self.send(Command::SetWhammyOn(on));
+                self.set_whammy_ui(on);
             }
             ArpEvent::ToggleGuitar => {
                 self.arp.guitar_on = !self.arp.guitar_on;
