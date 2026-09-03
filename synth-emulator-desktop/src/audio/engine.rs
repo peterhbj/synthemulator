@@ -2,12 +2,15 @@ use std::collections::HashSet;
 use std::f32::consts::PI;
 
 use crate::synth::{
-    build_arp_sequence, sixteenth, step_seconds, ArpDivision, ArpPattern, Command, SynthParams,
-    ANALYSER_SIZE, MAX_VOICES, MIN_ENV, VOICE_GAIN, WHAMMY_SEQUENCE,
+    build_arp_sequence, sixteenth, step_seconds, ArpDivision, ArpPattern, Command, FootLearn,
+    SynthParams, ANALYSER_SIZE, MAX_VOICES, MIN_ENV, VOICE_GAIN, WHAMMY_SEQUENCE,
 };
 
+use super::fuzz_factory::{FuzzFactory, FuzzKnobs};
+use super::gt100::GtCmd;
 use super::osc;
 use super::ring::AudioRing;
+use crossbeam_channel::Sender;
 use std::sync::Arc;
 
 const FILTER_TC: f32 = 0.03;
@@ -222,14 +225,28 @@ pub struct Engine {
     guitar_on: bool,
     guitar_gain: f32,
     guitar_level: f32,
+    fuzz: FuzzFactory,
+    fuzz_on: bool,
+    foot_whammy_cc: u8,
+    foot_fuzz_cc: u8,
+    foot_learn: Option<FootLearn>,
+    cc_last: [u8; 128],
+    gt_tx: Option<Sender<GtCmd>>,
+    gt_active: bool,
+    last_gt_semitones: Option<i32>,
 }
 
 impl Engine {
+    #[cfg(test)]
     pub fn new(sample_rate: f32) -> Self {
-        Self::with_guitar(sample_rate, Arc::new(AudioRing::new(1024)))
+        Self::with_guitar(sample_rate, Arc::new(AudioRing::new(1024)), None)
     }
 
-    pub fn with_guitar(sample_rate: f32, guitar_ring: Arc<AudioRing>) -> Self {
+    pub fn with_guitar(
+        sample_rate: f32,
+        guitar_ring: Arc<AudioRing>,
+        gt_tx: Option<Sender<GtCmd>>,
+    ) -> Self {
         let params = SynthParams::default();
         let master_coeff = (-1.0 / (VOL_TC * sample_rate)).exp();
         let bend_coeff = (-1.0 / (BEND_TC * sample_rate)).exp();
@@ -272,6 +289,15 @@ impl Engine {
             guitar_on: false,
             guitar_gain: 0.85,
             guitar_level: 0.0,
+            fuzz: FuzzFactory::new(sample_rate),
+            fuzz_on: false,
+            foot_whammy_cc: 80,
+            foot_fuzz_cc: 81,
+            foot_learn: None,
+            cc_last: [0; 128],
+            gt_tx,
+            gt_active: false,
+            last_gt_semitones: None,
             params,
         }
     }
@@ -326,9 +352,119 @@ impl Engine {
             Command::SetArpPool(pool) => self.arp_pool = pool,
             Command::RestartArp => self.restart_arp(),
             Command::ClearArp => self.clear_arp(),
-            Command::SetWhammyOn(on) => self.set_whammy_on(on),
-            Command::SetGuitarOn(on) => self.guitar_on = on,
+            Command::SetWhammyOn(on) => {
+                if on {
+                    self.guitar_on = true;
+                }
+                self.set_whammy_on(on);
+            }
+            Command::SetGuitarOn(on) => {
+                self.guitar_on = on;
+                self.sync_gt100();
+            }
             Command::SetGuitarGain(g) => self.guitar_gain = g.clamp(0.0, 1.5),
+            Command::SetFuzzOn(on) => {
+                self.fuzz_on = on;
+                if on {
+                    self.guitar_on = true;
+                }
+            }
+            Command::SetFuzzVol(v) => {
+                self.fuzz_on = true;
+                let mut k = self.fuzz.knobs();
+                k.vol = v;
+                self.fuzz.set_knobs(k);
+            }
+            Command::SetFuzzGate(v) => {
+                self.fuzz_on = true;
+                let mut k = self.fuzz.knobs();
+                k.gate = v;
+                self.fuzz.set_knobs(k);
+            }
+            Command::SetFuzzComp(v) => {
+                self.fuzz_on = true;
+                let mut k = self.fuzz.knobs();
+                k.comp = v;
+                self.fuzz.set_knobs(k);
+            }
+            Command::SetFuzzDrive(v) => {
+                self.fuzz_on = true;
+                let mut k = self.fuzz.knobs();
+                k.drive = v;
+                self.fuzz.set_knobs(k);
+            }
+            Command::SetFuzzStab(v) => {
+                self.fuzz_on = true;
+                let mut k = self.fuzz.knobs();
+                k.stab = v;
+                self.fuzz.set_knobs(k);
+            }
+            Command::MidiCc { cc, val } => self.handle_midi_cc(cc, val),
+            Command::LearnFoot(target) => {
+                self.foot_learn = if self.foot_learn == target {
+                    None
+                } else {
+                    target
+                };
+            }
+        }
+    }
+
+    fn handle_midi_cc(&mut self, cc: u8, val: u8) {
+        if let Some(target) = self.foot_learn {
+            if val >= 64 && !reserved_learn_cc(cc) {
+                match target {
+                    FootLearn::Whammy => self.foot_whammy_cc = cc,
+                    FootLearn::Fuzz => self.foot_fuzz_cc = cc,
+                }
+                self.foot_learn = None;
+                self.cc_last[cc as usize] = val;
+                self.press_foot(target);
+                return;
+            }
+            self.cc_last[cc as usize] = val;
+            return;
+        }
+
+        let prev = self.cc_last[cc as usize];
+        self.cc_last[cc as usize] = val;
+        // CTL stomps send ~0/127. Ignore EXP-style sweeps so the fuzz stays on.
+        if cc == self.foot_whammy_cc {
+            if val >= 110 && prev < 40 {
+                self.toggle_whammy();
+            }
+            return;
+        }
+        if cc == self.foot_fuzz_cc {
+            if val >= 110 && prev < 40 {
+                self.toggle_fuzz();
+            }
+            return;
+        }
+        if let Some(cmd) = Command::from_cc(cc, val) {
+            self.handle(cmd);
+        }
+    }
+
+    fn press_foot(&mut self, target: FootLearn) {
+        match target {
+            FootLearn::Whammy => self.toggle_whammy(),
+            FootLearn::Fuzz => self.toggle_fuzz(),
+        }
+    }
+
+    fn toggle_whammy(&mut self) {
+        let on = !self.whammy_on;
+        if on {
+            self.guitar_on = true;
+        }
+        self.set_whammy_on(on);
+    }
+
+    fn toggle_fuzz(&mut self) {
+        self.fuzz_on = !self.fuzz_on;
+        if self.fuzz_on {
+            self.guitar_on = true;
         }
     }
 
@@ -423,6 +559,7 @@ impl Engine {
             self.whammy_applied = 0;
             self.whammy_samples_until = 0.0;
             self.octave_shift = WHAMMY_SEQUENCE[0] as f32;
+            self.sync_gt100();
             return;
         }
         self.whammy_on = false;
@@ -430,6 +567,24 @@ impl Engine {
         self.whammy_applied = 0;
         self.whammy_samples_until = 0.0;
         self.octave_shift = 0.0;
+        self.sync_gt100();
+    }
+
+    fn sync_gt100(&mut self) {
+        let Some(tx) = &self.gt_tx else {
+            return;
+        };
+        let want = self.guitar_on && self.whammy_on;
+        if want && !self.gt_active {
+            self.gt_active = true;
+            let st = WHAMMY_SEQUENCE[self.whammy_applied.min(WHAMMY_SEQUENCE.len() - 1)];
+            let _ = tx.try_send(GtCmd::Enable { semitones: st });
+            self.last_gt_semitones = Some(st);
+        } else if !want && self.gt_active {
+            self.gt_active = false;
+            self.last_gt_semitones = None;
+            let _ = tx.try_send(GtCmd::Disable);
+        }
     }
 
     fn panic(&mut self) {
@@ -592,6 +747,12 @@ impl Engine {
             self.whammy_applied = self.whammy_step;
             let semitones = WHAMMY_SEQUENCE[self.whammy_step];
             self.octave_shift = semitones as f32;
+            if self.gt_active && self.last_gt_semitones != Some(semitones) {
+                self.last_gt_semitones = Some(semitones);
+                if let Some(tx) = &self.gt_tx {
+                    let _ = tx.try_send(GtCmd::Pitch(semitones));
+                }
+            }
             self.whammy_step = (self.whammy_step + 1) % WHAMMY_SEQUENCE.len();
             let dur = sixteenth(self.arp_tempo) as f64 * self.sr as f64;
             self.whammy_samples_until += dur;
@@ -654,18 +815,27 @@ impl Engine {
             mix += self.tick_voice(i);
         }
 
+        // Pitch is applied on the GT-100 via SysEx DT1. USB guitar is dry.
         let g_in = self.guitar_ring.pop().unwrap_or(0.0);
         self.guitar_level = self.guitar_level * 0.995 + g_in.abs() * 0.005;
-        if self.guitar_on {
-            // Pitch is applied on the GT-100 via SysEx DT1 (midi_out.rs).
-            mix += g_in * self.guitar_gain;
-        }
+        // Synth filter/compressor stay on the keyboard path. Guitar and the
+        // Fuzz Factory sit after it so harmonics and squeal are not low-passed.
+        let synth = self.compressor.process(self.filter.process(mix));
+        let guitar_sig = if self.fuzz_on || self.guitar_on {
+            g_in * self.guitar_gain
+        } else {
+            0.0
+        };
+        let pre = synth + guitar_sig;
+        let wet = if self.fuzz_on {
+            self.fuzz.process(pre)
+        } else {
+            pre
+        };
         self.voices
             .retain(|v| !(matches!(v.stage, EnvStage::Release) && v.gain <= 0.00012));
 
-        let filtered = self.filter.process(mix);
-        let compressed = self.compressor.process(filtered);
-        let out = (compressed * self.master).clamp(-1.0, 1.0);
+        let out = (wet * self.master).clamp(-1.0, 1.0);
 
         self.analyser[self.analyser_i] = out;
         self.analyser_i = (self.analyser_i + 1) % ANALYSER_SIZE;
@@ -699,11 +869,21 @@ impl Engine {
             sample_rate: self.sr,
             guitar_on: self.guitar_on,
             guitar_level: self.guitar_level,
+            fuzz_on: self.fuzz_on,
+            fuzz_va: self.fuzz.va(),
+            fuzz_knobs: self.fuzz.knobs(),
+            foot_whammy_cc: self.foot_whammy_cc,
+            foot_fuzz_cc: self.foot_fuzz_cc,
+            foot_learn: self.foot_learn,
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+fn reserved_learn_cc(cc: u8) -> bool {
+    matches!(cc, 64 | 120 | 123)
+}
+
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     pub time_domain: Vec<f32>,
     pub active_notes: Vec<u8>,
@@ -717,6 +897,37 @@ pub struct Snapshot {
     pub sample_rate: f32,
     pub guitar_on: bool,
     pub guitar_level: f32,
+    pub fuzz_on: bool,
+    pub fuzz_va: f32,
+    pub fuzz_knobs: FuzzKnobs,
+    pub foot_whammy_cc: u8,
+    pub foot_fuzz_cc: u8,
+    pub foot_learn: Option<FootLearn>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            time_domain: Vec::new(),
+            active_notes: Vec::new(),
+            arp_pool: Vec::new(),
+            held_notes: Vec::new(),
+            pedal: false,
+            arp_on: false,
+            whammy_on: false,
+            whammy_step: 0,
+            bend: 0.0,
+            sample_rate: 0.0,
+            guitar_on: false,
+            guitar_level: 0.0,
+            fuzz_on: false,
+            fuzz_va: 9.0,
+            fuzz_knobs: FuzzKnobs::default(),
+            foot_whammy_cc: 80,
+            foot_fuzz_cc: 81,
+            foot_learn: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -743,5 +954,55 @@ mod tests {
             sum += e.render().abs();
         }
         assert!(sum < 1e-4);
+    }
+
+    #[test]
+    fn guitar_whammy_drives_gt100_not_shifter() {
+        use crate::audio::GtCmd;
+        use crossbeam_channel::bounded;
+
+        let (tx, rx) = bounded(16);
+        let mut e = Engine::with_guitar(48_000.0, Arc::new(AudioRing::new(1024)), Some(tx));
+        e.handle(Command::SetGuitarOn(true));
+        assert!(rx.try_recv().is_err());
+        e.handle(Command::SetWhammyOn(true));
+        match rx.try_recv().unwrap() {
+            GtCmd::Enable { semitones } => assert_eq!(semitones, -12),
+            other => panic!("expected Enable, got {other:?}"),
+        }
+        e.handle(Command::SetWhammyOn(false));
+        assert!(matches!(rx.try_recv().unwrap(), GtCmd::Disable));
+    }
+
+    #[test]
+    fn footswitch_toggles_on_press_ignores_release() {
+        let mut e = Engine::new(48_000.0);
+        e.handle(Command::MidiCc { cc: 80, val: 127 });
+        assert!(e.snapshot().whammy_on);
+        e.handle(Command::MidiCc { cc: 80, val: 0 });
+        assert!(e.snapshot().whammy_on, "release must not turn it off");
+        e.handle(Command::MidiCc { cc: 80, val: 127 });
+        assert!(!e.snapshot().whammy_on);
+        e.handle(Command::MidiCc { cc: 81, val: 127 });
+        assert!(e.snapshot().fuzz_on);
+        e.handle(Command::MidiCc { cc: 81, val: 0 });
+        assert!(e.snapshot().fuzz_on);
+        e.handle(Command::MidiCc { cc: 81, val: 127 });
+        assert!(!e.snapshot().fuzz_on);
+    }
+
+    #[test]
+    fn footswitch_learn_assigns_cc() {
+        let mut e = Engine::new(48_000.0);
+        e.handle(Command::LearnFoot(Some(FootLearn::Fuzz)));
+        e.handle(Command::MidiCc { cc: 70, val: 127 });
+        let snap = e.snapshot();
+        assert_eq!(snap.foot_fuzz_cc, 70);
+        assert!(snap.foot_learn.is_none());
+        assert!(snap.fuzz_on);
+        e.handle(Command::MidiCc { cc: 70, val: 0 });
+        assert!(e.snapshot().fuzz_on);
+        e.handle(Command::MidiCc { cc: 70, val: 127 });
+        assert!(!e.snapshot().fuzz_on);
     }
 }

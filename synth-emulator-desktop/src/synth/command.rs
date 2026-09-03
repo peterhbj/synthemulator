@@ -28,4 +28,37 @@ pub enum Command {
     SetWhammyOn(bool),
     SetGuitarOn(bool),
     SetGuitarGain(f32),
+    SetFuzzOn(bool),
+    SetFuzzVol(f32),
+    SetFuzzGate(f32),
+    SetFuzzComp(f32),
+    SetFuzzDrive(f32),
+    SetFuzzStab(f32),
+    /// Raw CC from keyboard or GT-100. Engine maps footswitches (toggle on press).
+    MidiCc { cc: u8, val: u8 },
+    LearnFoot(Option<FootLearn>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FootLearn {
+    Whammy,
+    Fuzz,
+}
+
+impl Command {
+    /// Continuous / follow CCs. Footswitches (80/81 by default) are handled in the engine.
+    pub fn from_cc(cc: u8, val: u8) -> Option<Self> {
+        let on = val >= 64;
+        let unipolar = val as f32 / 127.0;
+        match cc {
+            16 => Some(Self::SetFuzzGate(unipolar)),
+            17 => Some(Self::SetFuzzComp(unipolar)),
+            18 => Some(Self::SetFuzzStab(unipolar)),
+            19 => Some(Self::SetFuzzDrive(unipolar)),
+            20 => Some(Self::SetFuzzVol(unipolar)),
+            64 => Some(Self::SetPedal(on)),
+            120 | 123 => Some(Self::Panic),
+            _ => None,
+        }
+    }
 }

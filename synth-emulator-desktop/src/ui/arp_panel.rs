@@ -24,6 +24,7 @@ pub enum ArpEvent {
     ToggleLatch,
     Clear,
     ToggleWhammy,
+    LearnWhammy,
     ToggleGuitar,
     GuitarGain,
     Pattern(ArpPattern),
@@ -34,7 +35,12 @@ pub enum ArpEvent {
     Preset(ArpPresetId),
 }
 
-pub fn arp_panel(ui: &mut Ui, state: &mut ArpUiState) -> Vec<ArpEvent> {
+pub fn arp_panel(
+    ui: &mut Ui,
+    state: &mut ArpUiState,
+    whammy_cc: u8,
+    learning_whammy: bool,
+) -> Vec<ArpEvent> {
     let mut events = Vec::new();
     egui::Frame::new()
         .fill(Color32::from_rgba_unmultiplied(0x19, 0x19, 0x1d, 153))
@@ -77,12 +83,29 @@ pub fn arp_panel(ui: &mut Ui, state: &mut ArpUiState) -> Vec<ArpEvent> {
                 {
                     events.push(ArpEvent::ToggleWhammy);
                 }
+                if chip(
+                    ui,
+                    if learning_whammy {
+                        "pisa o CTL…"
+                    } else {
+                        "Learn"
+                    },
+                    learning_whammy,
+                )
+                .clicked()
+                {
+                    events.push(ArpEvent::LearnWhammy);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new("−1 / 0 / +1")
-                            .monospace()
-                            .size(11.0)
-                            .color(MUTED),
+                        egui::RichText::new(if learning_whammy {
+                            "pisa o pedal pra gravar".into()
+                        } else {
+                            format!("CC {whammy_cc} tap · −1 / 0 / +1")
+                        })
+                        .monospace()
+                        .size(11.0)
+                        .color(MUTED),
                     );
                 });
             });
@@ -101,7 +124,7 @@ pub fn arp_panel(ui: &mut Ui, state: &mut ArpUiState) -> Vec<ArpEvent> {
                     events.push(ArpEvent::ToggleGuitar);
                 }
                 ui.label(
-                    egui::RichText::new("poly FFT · acorde inteiro −1 / 0 / +1")
+                    egui::RichText::new("P.SHIFT na GT-100 · acorde −1 / 0 / +1")
                         .size(11.0)
                         .color(MUTED),
                 );
