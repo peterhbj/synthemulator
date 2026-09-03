@@ -428,14 +428,15 @@ impl Engine {
 
         let prev = self.cc_last[cc as usize];
         self.cc_last[cc as usize] = val;
+        // CTL stomps send ~0/127. Ignore EXP-style sweeps so the fuzz stays on.
         if cc == self.foot_whammy_cc {
-            if val >= 64 && prev < 64 {
+            if val >= 110 && prev < 40 {
                 self.toggle_whammy();
             }
             return;
         }
         if cc == self.foot_fuzz_cc {
-            if val >= 64 && prev < 64 {
+            if val >= 110 && prev < 40 {
                 self.toggle_fuzz();
             }
             return;
@@ -983,7 +984,7 @@ mod tests {
         assert!(e.snapshot().whammy_on, "release must not turn it off");
         e.handle(Command::MidiCc { cc: 80, val: 127 });
         assert!(!e.snapshot().whammy_on);
-        e.handle(Command::MidiCc { cc: 81, val: 100 });
+        e.handle(Command::MidiCc { cc: 81, val: 127 });
         assert!(e.snapshot().fuzz_on);
         e.handle(Command::MidiCc { cc: 81, val: 0 });
         assert!(e.snapshot().fuzz_on);

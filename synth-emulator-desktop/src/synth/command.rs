@@ -56,7 +56,6 @@ impl Command {
             18 => Some(Self::SetFuzzStab(unipolar)),
             19 => Some(Self::SetFuzzDrive(unipolar)),
             20 => Some(Self::SetFuzzVol(unipolar)),
-            21 => Some(Self::SetFuzzOn(on)),
             64 => Some(Self::SetPedal(on)),
             120 | 123 => Some(Self::Panic),
             _ => None,

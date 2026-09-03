@@ -90,6 +90,9 @@ pub fn fuzz_panel(
                 if chip(ui, "Hi Comp", false).clicked() {
                     events.push(FuzzEvent::Preset(FuzzKnobs::gated_hi()));
                 }
+                if chip(ui, "Plug In", false).clicked() {
+                    events.push(FuzzEvent::Preset(FuzzKnobs::plug()));
+                }
             });
 
             ui.add_space(6.0);
