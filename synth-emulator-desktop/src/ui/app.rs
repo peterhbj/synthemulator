@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui::{self, Color32, Key, Margin};
 
 use super::arp_panel::{self, ArpEvent, ArpUiState};
+use super::fuzz_panel::{self, FuzzEvent, FuzzUiState};
 use super::keyboard;
 use super::oscilloscope;
 use super::pitch_wheel;
@@ -10,10 +11,10 @@ use super::theme::{self, BG, FG, MUTED, SUBTLE, SURFACE};
 use super::widgets::{
     badge_pill, format_hz, format_ms, format_pct, icon_button, knob, volume_slider, waveform_select,
 };
-use crate::audio::{AudioHost, GuitarInput, MidiHub};
+use crate::audio::{AudioHost, Gt100Hub, GuitarInput, MidiHub};
 use crate::synth::{
     midi_to_name, notes_from_preset, octave_base_midi, ArpDivision, ArpPattern, ArpPresetId,
-    Command, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES,
+    Command, FootLearn, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES,
 };
 
 pub struct HelixApp {
@@ -23,11 +24,13 @@ pub struct HelixApp {
     midi_err: Option<String>,
     guitar: Option<GuitarInput>,
     guitar_err: Option<String>,
+    gt100: Option<Gt100Hub>,
     params: SynthParams,
     octave: i32,
     bend: f32,
     bend_range: u8,
     arp: ArpUiState,
+    fuzz: FuzzUiState,
     pointer_held: HashSet<u8>,
     key_held: HashMap<Key, u8>,
     arrow_up: bool,
@@ -48,17 +51,19 @@ impl HelixApp {
             o.zoom_with_keyboard = false;
         });
 
-        let (audio, audio_err, midi, guitar) = match AudioHost::start() {
-            Ok(host) => {
-                let midi = MidiHub::new(host.sender());
+        let (audio, audio_err, midi, guitar, gt100) = match AudioHost::start() {
+            Ok(mut host) => {
+                let sender = host.sender();
+                let midi = MidiHub::new(sender.clone());
                 let guitar = GuitarInput::new(
                     host.guitar_ring.clone(),
                     host.guitar_peak.clone(),
                     host.sample_rate,
                 );
-                (Some(host), None, Some(midi), Some(guitar))
+                let gt100 = host.take_gt_rx().map(|rx| Gt100Hub::new(rx, sender.clone()));
+                (Some(host), None, Some(midi), Some(guitar), gt100)
             }
-            Err(e) => (None, Some(e), None, None),
+            Err(e) => (None, Some(e), None, None, None),
         };
 
         Self {
@@ -68,6 +73,7 @@ impl HelixApp {
             midi_err: None,
             guitar,
             guitar_err: None,
+            gt100,
             params: SynthParams::default(),
             octave: 3,
             bend: 0.0,
@@ -86,6 +92,7 @@ impl HelixApp {
                 guitar_on: false,
                 guitar_gain: 0.85,
             },
+            fuzz: FuzzUiState::default(),
             pointer_held: HashSet::new(),
             key_held: HashMap::new(),
             arrow_up: false,
@@ -239,6 +246,12 @@ impl eframe::App for HelixApp {
                     if let Err(e) = g.auto_connect() {
                         self.guitar_err = Some(e);
                     }
+                }
+            }
+            if let Some(gt) = self.gt100.as_mut() {
+                gt.refresh();
+                if !gt.hold_off {
+                    let _ = gt.auto_connect();
                 }
             }
         }
@@ -455,13 +468,51 @@ impl HelixApp {
                 });
 
                 ui.add_space(10.0);
-                let events = arp_panel::arp_panel(ui, &mut self.arp);
+                let fuzz_events = fuzz_panel::fuzz_panel(
+                    ui,
+                    &mut self.fuzz,
+                    snap.fuzz_va,
+                    snap.foot_fuzz_cc,
+                    snap.foot_learn == Some(FootLearn::Fuzz),
+                );
+                let fuzz_touched = !fuzz_events.is_empty();
+                for ev in fuzz_events {
+                    self.handle_fuzz_event(ev);
+                }
+                if !fuzz_touched {
+                    self.fuzz.on = snap.fuzz_on;
+                    self.fuzz.knobs = snap.fuzz_knobs;
+                }
+                ui.add_space(8.0);
+                let events = arp_panel::arp_panel(
+                    ui,
+                    &mut self.arp,
+                    snap.foot_whammy_cc,
+                    snap.foot_learn == Some(FootLearn::Whammy),
+                );
+                let arp_touched = events.iter().any(|e| {
+                    matches!(
+                        e,
+                        ArpEvent::ToggleWhammy | ArpEvent::ToggleGuitar | ArpEvent::LearnWhammy
+                    )
+                });
                 for ev in events {
                     self.handle_arp_event(ev);
                 }
+                if !arp_touched {
+                    self.arp.whammy_on = snap.whammy_on;
+                    self.arp.guitar_on = snap.guitar_on;
+                }
                 guitar_in_picker(ui, self);
+                gt100_picker(ui, self);
                 if let Some(err) = &self.guitar_err {
                     ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                }
+                if let Some(gt) = &self.gt100 {
+                    let st = gt.status();
+                    if let Some(err) = st.err {
+                        ui.colored_label(Color32::from_rgb(220, 80, 80), err);
+                    }
                 }
 
                 ui.add_space(6.0);
@@ -489,6 +540,7 @@ impl HelixApp {
                     badge_pill(ui, "Arp", self.arp.arp_on);
                     badge_pill(ui, "Whammy", self.arp.whammy_on);
                     badge_pill(ui, "Guitar", self.arp.guitar_on);
+                    badge_pill(ui, "Fuzz", self.fuzz.on);
                     ui.allocate_ui(
                         egui::vec2(ui.available_width().clamp(160.0, 280.0), 28.0),
                         |ui| {
@@ -545,7 +597,7 @@ impl HelixApp {
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new(
-                "Whammy loops the Map of the Problematique octave pattern (−1 / 0 / +1) on 16ths. Pair it with a loop and twist the filter. Latch holds your chord. Drag the bend wheel or hold up/down arrows. Z and Q rows play notes, Space sustains, [ ] shifts octave, Esc silences all. MIDI USB: notes, sustain, pitch bend.",
+                "Fuzz Factory sits on the output (keys + guitar). On, then play Z/Q or guitar. Stab down = squeal (no input needed). Gate up = velcro. Pedais: toque (não segure). Learn + pisa o CTL pra gravar. Default CC 80 Whammy, 81 Fuzz. Knobs 16–20. Whammy loops −1 / 0 / +1 on 16ths. Space sustains, [ ] octave, Esc panic.",
             )
             .size(12.0)
             .color(MUTED),
@@ -576,6 +628,9 @@ impl HelixApp {
                 self.arp.whammy_on = !self.arp.whammy_on;
                 self.send(Command::SetWhammyOn(self.arp.whammy_on));
             }
+            ArpEvent::LearnWhammy => {
+                self.send(Command::LearnFoot(Some(FootLearn::Whammy)));
+            }
             ArpEvent::ToggleGuitar => {
                 self.arp.guitar_on = !self.arp.guitar_on;
                 self.send(Command::SetGuitarOn(self.arp.guitar_on));
@@ -588,7 +643,7 @@ impl HelixApp {
                         }
                         if g.connected.is_none() {
                             self.guitar_err = Some(
-                                "Plugue a GT-100 via USB e ligue Guitar On (entrada, não MIDI)."
+                                "Plugue a GT-100 via USB (áudio + MIDI 1). Guitar On monitora o USB; Whammy manda o pitch pra pedaleira."
                                     .into(),
                             );
                         }
@@ -623,10 +678,126 @@ impl HelixApp {
             }
         }
     }
+
+    fn handle_fuzz_event(&mut self, ev: FuzzEvent) {
+        match ev {
+            FuzzEvent::Toggle => {
+                self.fuzz.on = !self.fuzz.on;
+                self.send(Command::SetFuzzOn(self.fuzz.on));
+                if self.fuzz.on {
+                    self.arm_fuzz_input();
+                }
+            }
+            FuzzEvent::Knobs => {
+                if !self.fuzz.on {
+                    self.fuzz.on = true;
+                    self.send(Command::SetFuzzOn(true));
+                    self.arm_fuzz_input();
+                }
+                self.send_fuzz_knobs();
+            }
+            FuzzEvent::Preset(k) => {
+                self.fuzz.knobs = k;
+                if !self.fuzz.on {
+                    self.fuzz.on = true;
+                    self.send(Command::SetFuzzOn(true));
+                }
+                self.arm_fuzz_input();
+                self.send_fuzz_knobs();
+            }
+            FuzzEvent::Learn => {
+                self.send(Command::LearnFoot(Some(FootLearn::Fuzz)));
+            }
+        }
+    }
+
+    fn arm_fuzz_input(&mut self) {
+        if !self.arp.guitar_on {
+            self.arp.guitar_on = true;
+            self.send(Command::SetGuitarOn(true));
+        }
+        if let Some(g) = self.guitar.as_mut() {
+            g.hold_off = false;
+            let _ = g.auto_connect();
+        }
+    }
+
+    fn send_fuzz_knobs(&self) {
+        let k = self.fuzz.knobs;
+        self.send(Command::SetFuzzVol(k.vol));
+        self.send(Command::SetFuzzGate(k.gate));
+        self.send(Command::SetFuzzComp(k.comp));
+        self.send(Command::SetFuzzDrive(k.drive));
+        self.send(Command::SetFuzzStab(k.stab));
+    }
 }
 
 fn short_midi_name(name: &str) -> String {
     name.split(':').next().unwrap_or(name).trim().to_string()
+}
+
+fn short_port_name(name: &str) -> String {
+    let l = name.to_ascii_lowercase();
+    if l.contains("gt-100") || l.contains("gt100") {
+        if l.contains("midi 2") || l.contains("midi2") {
+            return "GT-100 MIDI 2".into();
+        }
+        return "GT-100 MIDI 1".into();
+    }
+    short_midi_name(name)
+}
+
+fn gt100_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
+    let Some(gt) = app.gt100.as_mut() else {
+        return;
+    };
+    let st = gt.status();
+    ui.horizontal(|ui| {
+        ui.label(theme::section_label("GT-100"));
+        let live = st.live || st.taken_over;
+        let label = if st.taken_over {
+            st.line()
+        } else {
+            st.connected
+                .as_deref()
+                .map(short_port_name)
+                .unwrap_or_else(|| "MIDI out".to_string())
+        };
+        let label_color = if live { theme::ACCENT_FG } else { FG };
+        egui::Frame::new()
+            .fill(if live { theme::ACCENT } else { theme::ELEVATED })
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(4, 2))
+            .show(ui, |ui| {
+                egui::ComboBox::from_id_salt("gt100-out")
+                    .selected_text(egui::RichText::new(label).size(12.0).color(label_color))
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(st.connected.is_none(), "None")
+                            .clicked()
+                        {
+                            gt.disconnect();
+                        }
+                        let ports = gt.ports.clone();
+                        if ports.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Nenhuma MIDI out. Plugue a GT-100 USB.")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                        }
+                        for name in ports {
+                            let selected = st.connected.as_deref() == Some(name.as_str());
+                            if ui
+                                .selectable_label(selected, short_port_name(&name))
+                                .clicked()
+                            {
+                                let _ = gt.connect(&name);
+                            }
+                        }
+                    });
+            });
+    });
 }
 
 fn guitar_in_picker(ui: &mut egui::Ui, app: &mut HelixApp) {

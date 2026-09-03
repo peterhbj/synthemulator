@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, Sample, SampleFormat, StreamConfig};
+use cpal::{Sample, SampleFormat, SampleRate, StreamConfig};
 
+use super::host::open_low_latency;
 use super::ring::AudioRing;
 
 pub struct GuitarInput {
@@ -82,8 +83,10 @@ impl GuitarInput {
             .default_input_config()
             .map_err(|e| format!("input config: {e}"))?;
         let mut config: StreamConfig = supported.config();
-        config.buffer_size = BufferSize::Fixed(256);
-        let in_sr = config.sample_rate.0 as f32;
+        let native_rate = config.sample_rate;
+        // Prefer the output rate so the guitar ring does not slowly fill.
+        let out_rate = self.out_sr.round().max(1.0) as u32;
+        config.sample_rate = SampleRate(out_rate);
         let channels = config.channels as usize;
         let ring = self.ring.clone();
         let peak = self.peak.clone();
@@ -91,13 +94,13 @@ impl GuitarInput {
 
         let stream = match supported.sample_format() {
             SampleFormat::F32 => {
-                build_input::<f32>(&device, &config, channels, in_sr, out_sr, ring, peak)?
+                build_input::<f32>(&device, &config, channels, native_rate, out_sr, ring, peak)?
             }
             SampleFormat::I16 => {
-                build_input::<i16>(&device, &config, channels, in_sr, out_sr, ring, peak)?
+                build_input::<i16>(&device, &config, channels, native_rate, out_sr, ring, peak)?
             }
             SampleFormat::U16 => {
-                build_input::<u16>(&device, &config, channels, in_sr, out_sr, ring, peak)?
+                build_input::<u16>(&device, &config, channels, native_rate, out_sr, ring, peak)?
             }
             other => return Err(format!("formato de entrada: {other}")),
         };
@@ -112,7 +115,7 @@ fn build_input<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     channels: usize,
-    in_sr: f32,
+    native_rate: SampleRate,
     out_sr: f32,
     ring: Arc<AudioRing>,
     peak: Arc<AtomicU32>,
@@ -122,41 +125,40 @@ where
     f32: cpal::FromSample<T>,
 {
     let err_fn = |e| eprintln!("helix guitar: {e}");
-    let conv = RateConv::new(in_sr, out_sr);
-    let mut try_cfg = config.clone();
-    let make = |cfg: &StreamConfig| {
-        let ring = ring.clone();
-        let peak = peak.clone();
-        let mut conv = conv.clone();
-        let mut env = 0.0f32;
-        device.build_input_stream(
-            cfg,
-            move |data: &[T], _| {
-                let ch = channels.max(1);
-                for frame in data.chunks(ch) {
-                    let mut sum = 0.0;
-                    let n = frame.len().min(2).max(1);
-                    for s in frame.iter().take(n) {
-                        sum += (*s).to_sample::<f32>();
+    let try_open = |cfg: StreamConfig| {
+        open_low_latency(cfg, |cfg| {
+            let ring = ring.clone();
+            let peak = peak.clone();
+            let mut conv = RateConv::new(cfg.sample_rate.0 as f32, out_sr);
+            let mut env = 0.0f32;
+            device.build_input_stream(
+                cfg,
+                move |data: &[T], _| {
+                    let ch = channels.max(1);
+                    for frame in data.chunks(ch) {
+                        let mut sum = 0.0;
+                        let n = frame.len().min(2).max(1);
+                        for s in frame.iter().take(n) {
+                            sum += (*s).to_sample::<f32>();
+                        }
+                        let mono = sum / n as f32;
+                        env = env.max(mono.abs());
+                        conv.push(mono, &ring);
                     }
-                    let mono = sum / n as f32;
-                    env = env.max(mono.abs());
-                    conv.push(mono, &ring);
-                }
-                env *= 0.85;
-                peak.store(env.to_bits(), Ordering::Relaxed);
-            },
-            err_fn,
-            None,
-        )
+                    env *= 0.85;
+                    peak.store(env.to_bits(), Ordering::Relaxed);
+                },
+                err_fn,
+                None,
+            )
+        })
     };
-    match make(&try_cfg) {
-        Ok(s) => Ok(s),
-        Err(_) => {
-            try_cfg.buffer_size = BufferSize::Default;
-            make(&try_cfg).map_err(|e| format!("open guitar input: {e}"))
-        }
-    }
+    try_open(config.clone()).or_else(|_| {
+        let mut native = config.clone();
+        native.sample_rate = native_rate;
+        try_open(native)
+    })
+    .map_err(|e| format!("open guitar input: {e}"))
 }
 
 #[derive(Clone)]

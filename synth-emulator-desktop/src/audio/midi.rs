@@ -132,6 +132,9 @@ fn pick_hardware_port(ports: &[String]) -> Option<String> {
             return -100;
         }
         let mut score = 10;
+        if super::gt100::is_gt100_name(name) {
+            return -100;
+        }
         if l.contains("yamaha") {
             score += 50;
         }
@@ -273,11 +276,10 @@ fn decode(status: u8, data: [u8; 2]) -> Option<Command> {
             }
         }
         0x80 => Some(Command::NoteOff { midi: data[0] }),
-        0xB0 => match data[0] {
-            64 => Some(Command::SetPedal(data[1] >= 64)),
-            120 | 123 => Some(Command::Panic),
-            _ => None,
-        },
+        0xB0 => Some(Command::MidiCc {
+            cc: data[0],
+            val: data[1],
+        }),
         0xE0 => {
             let value = data[0] as u16 | ((data[1] as u16) << 7);
             let amount = (value as f32 - 8192.0) / 8192.0;
@@ -331,8 +333,25 @@ mod tests {
     #[test]
     fn sustain_and_bend() {
         let cmds = collect(&[0xB0, 64, 127, 0xE0, 0x00, 0x40]);
-        assert!(matches!(cmds[0], Command::SetPedal(true)));
+        assert!(matches!(cmds[0], Command::MidiCc { cc: 64, val: 127 }));
         assert!(matches!(cmds[1], Command::SetBend { range: 0, .. }));
+    }
+
+    #[test]
+    fn fuzz_ccs() {
+        let cmds = collect(&[0xB0, 16, 64, 0xB0, 17, 0, 0xB0, 21, 127]);
+        assert!(matches!(cmds[0], Command::MidiCc { cc: 16, val: 64 }));
+        assert!(matches!(cmds[1], Command::MidiCc { cc: 17, val: 0 }));
+        assert!(matches!(cmds[2], Command::MidiCc { cc: 21, val: 127 }));
+    }
+
+    #[test]
+    fn gt100_ctl_ccs() {
+        let cmds = collect(&[0xB0, 80, 127, 0xB0, 81, 0, 0xB0, 80, 0, 0xB0, 81, 64]);
+        assert!(matches!(cmds[0], Command::MidiCc { cc: 80, val: 127 }));
+        assert!(matches!(cmds[1], Command::MidiCc { cc: 81, val: 0 }));
+        assert!(matches!(cmds[2], Command::MidiCc { cc: 80, val: 0 }));
+        assert!(matches!(cmds[3], Command::MidiCc { cc: 81, val: 64 }));
     }
 
     #[test]
@@ -343,5 +362,21 @@ mod tests {
         ])
         .unwrap()
         .contains("Digital Keyboard"));
+    }
+
+    #[test]
+    fn skips_gt100_as_keyboard() {
+        assert!(pick_hardware_port(&[
+            "GT-100:GT-100 MIDI 1 20:0".into(),
+            "GT-100:GT-100 MIDI 2 20:1".into(),
+            "Digital Keyboard:Digital Keyboard MIDI 1 24:0".into(),
+        ])
+        .unwrap()
+        .contains("Digital Keyboard"));
+        assert!(pick_hardware_port(&[
+            "Midi Through:Midi Through Port-0 14:0".into(),
+            "GT-100:GT-100 MIDI 2 20:1".into(),
+        ])
+        .is_none());
     }
 }

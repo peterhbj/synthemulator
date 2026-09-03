@@ -6,6 +6,7 @@ use cpal::{BufferSize, SampleFormat, StreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use super::engine::{Engine, Snapshot};
+use super::gt100::GtCmd;
 use super::ring::AudioRing;
 use crate::synth::Command;
 
@@ -19,10 +20,12 @@ pub struct AudioHost {
     pub device_name: String,
     pub guitar_ring: Arc<AudioRing>,
     pub guitar_peak: Arc<AtomicU32>,
+    gt_rx: Option<Receiver<GtCmd>>,
 }
 
 impl AudioHost {
     pub fn start() -> Result<Self, AudioError> {
+        request_pipewire_latency();
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -33,12 +36,13 @@ impl AudioHost {
             .map_err(|e| format!("output config: {e}"))?;
 
         let mut config: StreamConfig = supported.config();
-        config.buffer_size = BufferSize::Fixed(256);
+        config.buffer_size = BufferSize::Fixed(128);
 
         let sample_rate = config.sample_rate.0 as f32;
         let channels = config.channels as usize;
         let (tx, rx) = bounded::<Command>(1024);
-        let guitar_ring = Arc::new(AudioRing::new(16_384));
+        let (gt_tx, gt_rx) = bounded::<GtCmd>(64);
+        let guitar_ring = Arc::new(AudioRing::new(4_096));
         let guitar_peak = Arc::new(AtomicU32::new(0));
         let snapshot = Arc::new(Mutex::new(Snapshot {
             sample_rate,
@@ -54,6 +58,7 @@ impl AudioHost {
                 rx,
                 snapshot.clone(),
                 guitar_ring.clone(),
+                gt_tx.clone(),
             )?,
             SampleFormat::I16 => build_stream::<i16>(
                 &device,
@@ -63,6 +68,7 @@ impl AudioHost {
                 rx,
                 snapshot.clone(),
                 guitar_ring.clone(),
+                gt_tx.clone(),
             )?,
             SampleFormat::U16 => build_stream::<u16>(
                 &device,
@@ -72,6 +78,7 @@ impl AudioHost {
                 rx,
                 snapshot.clone(),
                 guitar_ring.clone(),
+                gt_tx.clone(),
             )?,
             other => {
                 return Err(format!("unsupported sample format: {other}"));
@@ -88,7 +95,12 @@ impl AudioHost {
             device_name,
             guitar_ring,
             guitar_peak,
+            gt_rx: Some(gt_rx),
         })
+    }
+
+    pub fn take_gt_rx(&mut self) -> Option<Receiver<GtCmd>> {
+        self.gt_rx.take()
     }
 
     pub fn sender(&self) -> Sender<Command> {
@@ -112,19 +124,19 @@ fn build_stream<T>(
     rx: Receiver<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
     guitar_ring: Arc<AudioRing>,
+    gt_tx: Sender<GtCmd>,
 ) -> Result<cpal::Stream, AudioError>
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let mut try_config = config.clone();
-
     let err_fn = |e| eprintln!("helix audio: {e}");
 
     let make = |cfg: &StreamConfig| {
         let rx = rx.clone();
         let snapshot = snapshot.clone();
         let guitar_ring = guitar_ring.clone();
-        let mut engine = Engine::with_guitar(sample_rate, guitar_ring);
+        let gt_tx = gt_tx.clone();
+        let mut engine = Engine::with_guitar(sample_rate, guitar_ring, Some(gt_tx));
         device.build_output_stream(
             cfg,
             move |data: &mut [T], _| {
@@ -147,11 +159,26 @@ where
         )
     };
 
-    match make(&try_config) {
-        Ok(stream) => Ok(stream),
-        Err(_) => {
-            try_config.buffer_size = BufferSize::Default;
-            make(&try_config).map_err(|e| format!("open stream: {e}"))
+    open_low_latency(config.clone(), make).map_err(|e| format!("open stream: {e}"))
+}
+
+/// Ask PipeWire for a live-guitar quantum before ALSA streams open.
+pub(crate) fn request_pipewire_latency() {
+    if std::env::var_os("PIPEWIRE_LATENCY").is_none() {
+        std::env::set_var("PIPEWIRE_LATENCY", "128/48000");
+    }
+}
+
+pub(crate) fn open_low_latency<S, E>(
+    mut config: StreamConfig,
+    mut make: impl FnMut(&StreamConfig) -> Result<S, E>,
+) -> Result<S, E> {
+    for frames in [128u32, 64, 256] {
+        config.buffer_size = BufferSize::Fixed(frames);
+        if let Ok(stream) = make(&config) {
+            return Ok(stream);
         }
     }
+    config.buffer_size = BufferSize::Default;
+    make(&config)
 }
