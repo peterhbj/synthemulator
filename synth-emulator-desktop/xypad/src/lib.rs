@@ -10,6 +10,7 @@
 mod linux;
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))] mod hid_logic;
 
 /// Finger position, normalized. `y` grows upwards (top of the pad = 1).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
