@@ -182,12 +182,16 @@ mod tests {
     #[test]
     fn round_trip() {
         let path = temp_file("rt");
-        let mut s = Settings::default();
-        s.music_dir = Some(PathBuf::from("/music"));
+        let mut s = Settings {
+            music_dir: Some(PathBuf::from("/music")),
+            ..Settings::default()
+        };
         s.xy.remix = [XyTarget::Crossfader, XyTarget::EchoFeedback];
-        let mut memo = TrackMemo::default();
+        let mut memo = TrackMemo {
+            bpm: Some(124.0),
+            ..TrackMemo::default()
+        };
         memo.hot_cues[1] = Some(12.5);
-        memo.bpm = Some(124.0);
         assert!(s.set_memo(Path::new("/music/a.mp3"), memo.clone()));
         assert!(!s.set_memo(Path::new("/music/a.mp3"), memo.clone()));
         s.save_to(&path).unwrap();
@@ -219,8 +223,10 @@ mod tests {
     #[test]
     fn empty_memo_is_forgotten() {
         let mut s = Settings::default();
-        let mut memo = TrackMemo::default();
-        memo.bpm = Some(120.0);
+        let memo = TrackMemo {
+            bpm: Some(120.0),
+            ..TrackMemo::default()
+        };
         s.set_memo(Path::new("x"), memo);
         assert!(s.set_memo(Path::new("x"), TrackMemo::default()));
         assert!(s.tracks.is_empty());

@@ -1,6 +1,6 @@
 //! The Remix tab: two decks, the mixer, the library and the keyboard map.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -336,6 +336,7 @@ impl RemixUi {
     }
 
     /// Remix keyboard map. Returns true when the key was used.
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_key(
         &mut self,
         key: Key,
@@ -863,9 +864,9 @@ impl RemixUi {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    for i in 0..HOT_CUES {
-                        let set = ds.hot_cues[i].is_some();
-                        let fill = if set { CUE_COLORS[i] } else { ELEVATED };
+                    for (i, (cue, color)) in ds.hot_cues.iter().zip(CUE_COLORS).enumerate() {
+                        let set = cue.is_some();
+                        let fill = if set { color } else { ELEVATED };
                         let text = if set { BG } else { MUTED };
                         let r = ui
                             .add(
@@ -950,11 +951,19 @@ impl RemixUi {
                     }
                     if let Some(base) = ds.base_bpm {
                         let mut b = base;
-                        if ui
+                        let mut edited = ui
                             .add(egui::DragValue::new(&mut b).speed(0.01).range(30.0..=300.0).max_decimals(2).suffix(" bpm"))
                             .on_hover_text("BPM original da faixa (arraste para corrigir)")
-                            .changed()
-                        {
+                            .changed();
+                        // The detector can land an octave off (half or double time).
+                        for (label, factor, hint) in [("÷2", 0.5, "Metade do BPM detectado"), ("×2", 2.0, "Dobro do BPM detectado")] {
+                            let target = base * factor;
+                            if (30.0..=300.0).contains(&target) && chip(ui, label, false).on_hover_text(hint).clicked() {
+                                b = target;
+                                edited = true;
+                            }
+                        }
+                        if edited {
                             cmd(DeckCmd::SetBpm(b));
                             if let Some(t) = &self.decks[d].track {
                                 let mut memo = settings.memo(&t.path);

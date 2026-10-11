@@ -192,8 +192,7 @@ impl XyUi {
             self.pos = [t.x, t.y];
         }
         if self.touching {
-            for axis in 0..2 {
-                let target = targets[axis];
+            for (axis, &target) in targets.iter().enumerate() {
                 if target == XyTarget::None {
                     continue;
                 }

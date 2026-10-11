@@ -163,6 +163,7 @@ struct RemixLink {
     trash: Sender<Arc<Track>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -290,7 +291,7 @@ mod tests {
         for i in 0..1000 {
             let x = i as f32 / 50.0;
             let y = soft_clip(x);
-            assert!(y <= 1.0 && y >= 0.9 - 1e-6 || x <= 0.9, "{x} -> {y}");
+            assert!(x <= 0.9 || (0.9 - 1e-6..=1.0).contains(&y), "{x} -> {y}");
             assert_eq!(soft_clip(-x), -y);
         }
     }

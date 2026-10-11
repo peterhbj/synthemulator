@@ -591,9 +591,10 @@ pub struct Echo {
     sample_rate: f32,
     /// Largest delay time in seconds the buffers can hold.
     max_secs: f32,
-    /// Delay time in samples, gliding towards its target. The smoother is f32, so near
-    /// a large target it settles a few samples short (about 1e-4 relative); inaudible.
-    delay: Smoother,
+    /// Delay time in samples, gliding towards its target in f64: an f32 glide
+    /// stalls a sample or more off a large target, and a fractional read
+    /// position then dulls every repeat through the linear interpolation.
+    delay: DelayGlide,
     /// Feedback gain 0..=0.95, gliding so a change never steps the buffer write.
     feedback: Smoother,
     /// Wet send 0..=1, gliding for the same reason.
@@ -621,7 +622,7 @@ impl Echo {
             write: 0,
             sample_rate: fs,
             max_secs,
-            delay: Smoother::new(fs, ECHO_DELAY_SMOOTH_SECS, default_delay),
+            delay: DelayGlide::new(fs, ECHO_DELAY_SMOOTH_SECS, default_delay),
             feedback: Smoother::new(fs, ECHO_PARAM_SMOOTH_SECS, ECHO_DEFAULT_FEEDBACK),
             mix: Smoother::new(fs, ECHO_PARAM_SMOOTH_SECS, 0.0),
             damp: [FeedbackDamping::default(); 2],
@@ -667,7 +668,7 @@ impl Echo {
         let len = self.buf_l.len();
 
         // Fractional read `delay` samples behind the write head, linearly interpolated.
-        let delay = f64::from(self.delay.next());
+        let delay = self.delay.next();
         let mut read = self.write as f64 - delay;
         if read < 0.0 {
             read += len as f64;
@@ -692,6 +693,55 @@ impl Echo {
         }
 
         (l + dl, r + dr)
+    }
+}
+
+/// The echo's delay-time glide: a one-pole smoother in f64 that lands exactly
+/// on its target.
+#[derive(Clone, Copy, Debug)]
+struct DelayGlide {
+    value: f64,
+    target: f64,
+    coeff: f64,
+}
+
+impl DelayGlide {
+    fn new(sample_rate: f32, time_secs: f32, initial: f32) -> Self {
+        let coeff = (-1.0 / (f64::from(time_secs) * f64::from(sample_rate))).exp();
+        Self {
+            value: f64::from(initial),
+            target: f64::from(initial),
+            coeff,
+        }
+    }
+
+    fn set_target(&mut self, target: f32) {
+        self.target = f64::from(target);
+    }
+
+    fn target(&self) -> f64 {
+        self.target
+    }
+
+    #[cfg(test)]
+    fn value(&self) -> f64 {
+        self.value
+    }
+
+    fn snap(&mut self, v: f64) {
+        self.value = v;
+        self.target = v;
+    }
+
+    #[inline]
+    fn next(&mut self) -> f64 {
+        self.value = self.target + (self.value - self.target) * self.coeff;
+        // A thousandth of a sample: far below anything audible, and the glide
+        // then lands exactly instead of creeping for seconds.
+        if (self.value - self.target).abs() < 1e-3 {
+            self.value = self.target;
+        }
+        self.value
     }
 }
 
@@ -1259,9 +1309,9 @@ mod tests {
         e.set_time_secs(0.0);
         assert_eq!(e.delay.target(), 480.0);
         e.set_time_secs(100.0);
-        assert_eq!(e.delay.target(), 2.0 * FS);
+        assert_eq!(e.delay.target(), f64::from(2.0 * FS));
         e.set_time_secs(f32::NAN);
-        assert_eq!(e.delay.target(), 0.25 * FS);
+        assert_eq!(e.delay.target(), f64::from(0.25 * FS));
 
         e.set_feedback(2.0);
         assert_eq!(e.feedback.target(), ECHO_MAX_FEEDBACK);
@@ -1271,6 +1321,35 @@ mod tests {
         assert_eq!(e.mix.target(), 1.0);
         e.set_mix(f32::NAN);
         assert_eq!(e.mix.target(), 0.0);
+    }
+
+    #[test]
+    fn echo_delay_glide_lands_exactly_so_repeats_keep_their_level() {
+        // An f32 glide stalled about 1.4 samples above 12 000 and the linear
+        // interpolation then lowered every repeat.
+        let mut e = Echo::new(FS, 2.0);
+        e.set_time_secs(0.5);
+        e.set_mix(1.0);
+        e.set_feedback(0.0);
+        e.clear();
+        e.set_time_secs(0.25);
+        for _ in 0..FS as usize {
+            e.process(0.0, 0.0);
+        }
+        assert_eq!(e.delay.value(), 12_000.0);
+        // A one-sample impulse comes back at full level, one delay later.
+        let mut out = Vec::with_capacity(13_000);
+        out.push(e.process(1.0, 1.0).0);
+        for _ in 0..13_000 {
+            out.push(e.process(0.0, 0.0).0);
+        }
+        let (at, peak) = out[1..]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i + 1, v.abs()))
+            .fold((0, 0.0f32), |a, b| if b.1 > a.1 { b } else { a });
+        assert_eq!(at, 12_000);
+        assert!(peak > 0.9, "repeat peak {peak}");
     }
 
     #[test]
