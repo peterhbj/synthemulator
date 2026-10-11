@@ -1,0 +1,43 @@
+name: desktop
+
+on:
+  push:
+    paths:
+      - "synth-emulator-desktop/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "synth-emulator-desktop/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: synth-emulator-desktop
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: helix
+          - os: windows-latest
+            bin: helix.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: synth-emulator-desktop
+      - name: ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helix-${{ runner.os }}
+          path: synth-emulator-desktop/target/release/${{ matrix.bin }}
