@@ -212,7 +212,9 @@ impl RemixUi {
         let tx = self.load_tx.clone();
         let rate = self.sample_rate;
         std::thread::spawn(move || {
-            let result = remix::load_track(&path, rate)
+            // A decoder bug must not leave the deck stuck on "carregando".
+            let result = std::panic::catch_unwind(|| remix::load_track(&path, rate))
+                .unwrap_or_else(|_| Err(remix::LoadError::Decode("o decodificador travou".into())))
                 .map(Arc::new)
                 .map_err(|e| e.to_string());
             let _ = tx.send(LoadResult { deck, path, result });
