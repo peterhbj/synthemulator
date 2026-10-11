@@ -2,11 +2,18 @@
 name = "helix"
 version = "0.1.0"
 edition = "2021"
-description = "Native Linux desktop port of the Helix analog keyboard"
+description = "Helix: synth and live remix desktop app for Linux and Windows"
 license = "MIT"
 default-run = "helix"
 
+[workspace]
+members = ["remix", "xypad"]
+
 [dependencies]
+helix-remix = { path = "remix" }
+helix-xypad = { path = "xypad" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 cpal = "0.16"
 crossbeam-channel = "0.5"
 eframe = { version = "0.32", default-features = true, features = ["wayland"] }

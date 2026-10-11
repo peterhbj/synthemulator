@@ -1,0 +1,13 @@
+[package]
+name = "helix-remix"
+version = "0.1.0"
+edition = "2021"
+description = "Decks, mixer, decoding and tempo analysis for Helix's Remix tab"
+license = "MIT"
+
+[lib]
+name = "remix"
+
+[dependencies]
+symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "flac", "wav", "pcm", "adpcm", "vorbis", "ogg", "aac", "isomp4", "alac", "aiff"] }
+rubato = "0.16"
