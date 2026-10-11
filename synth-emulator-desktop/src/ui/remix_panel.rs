@@ -36,6 +36,12 @@ const LOOP_BEATS: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
 const AUTO_BEATS: [f32; 4] = [4.0, 8.0, 16.0, 32.0];
 /// Filter sweep speed while E/R or U/I is held (full range per second).
 const FILTER_SWEEP_PER_SEC: f32 = 0.9;
+/// Width of the mixer column; the row of five master knobs needs it.
+const MIXER_WIDTH: f32 = 364.0;
+/// Narrowest deck panel before the mixer moves under the decks.
+const MIN_DECK_WIDTH: f32 = 330.0;
+/// Room the "0:00.0 / -0:00.0" readout needs to sit right-aligned.
+const TIME_READOUT_WIDTH: f32 = 130.0;
 const CROSSFADER_GLIDE_SECS: f64 = 0.12;
 
 /// Where remix commands go. The app passes the audio host's sender.
@@ -569,19 +575,29 @@ impl RemixUi {
         }
         ui.add_space(6.0);
 
+        // Wide windows: deck A | mixer | deck B. Narrow ones (small laptop
+        // screens, Windows display scaling): both decks side by side and the
+        // mixer underneath, so nothing is cut off at the right edge.
         let full = ui.available_width();
-        let mixer_w = 300.0f32.min(full * 0.34);
-        let deck_w = ((full - mixer_w - 24.0) * 0.5).max(240.0);
+        let mixer_w = MIXER_WIDTH;
+        let three_columns = full >= mixer_w + 2.0 * MIN_DECK_WIDTH + 16.0;
+        let deck_w = if three_columns {
+            (full - mixer_w - 16.0) * 0.5
+        } else {
+            (full - 8.0) * 0.5
+        };
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
             for d in 0..DECKS {
                 if d == 1 {
                     ui.add_space(8.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(mixer_w, 0.0),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| settings_changed |= self.mixer(ui, state, settings, sink, now),
-                    );
-                    ui.add_space(8.0);
+                    if three_columns {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(mixer_w, 0.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| settings_changed |= self.mixer(ui, state, settings, sink, now),
+                        );
+                        ui.add_space(8.0);
+                    }
                 }
                 ui.allocate_ui_with_layout(
                     Vec2::new(deck_w, 0.0),
@@ -590,6 +606,16 @@ impl RemixUi {
                 );
             }
         });
+        if !three_columns {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(mixer_w.min(full), 0.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| settings_changed |= self.mixer(ui, state, settings, sink, now),
+                );
+            });
+        }
 
         if let Some((text, _)) = &self.message {
             ui.add_space(6.0);
@@ -830,28 +856,33 @@ impl RemixUi {
                         .unwrap_or_else(|| "—".into());
                     ui.add(egui::Label::new(RichText::new(title).size(13.5).color(FG)).truncate());
                 });
+                let mut time_below = false;
                 ui.horizontal(|ui| {
                     let bpm = ds.bpm.map(|b| format!("{b:.2}")).unwrap_or_else(|| "--.--".into());
                     ui.label(RichText::new(bpm).monospace().size(20.0).color(FG));
                     ui.label(RichText::new("BPM").size(10.5).color(SUBTLE));
                     ui.add_space(8.0);
-                    let speed = (ds.speed - 1.0) * 100.0;
+                    // Speed is 0 until the audio thread has published a state.
+                    let speed = if ds.speed > 0.0 { (ds.speed - 1.0) * 100.0 } else { 0.0 };
                     ui.label(RichText::new(format!("{speed:+.2}%")).monospace().size(12.0).color(MUTED));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let remain = (ds.duration_secs - ds.position_secs).max(0.0);
-                        ui.label(
-                            RichText::new(format!("{} / -{}", fmt_time(ds.position_secs), fmt_time(remain)))
-                                .monospace()
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                    });
+                    // Right-aligned when it fits, else on its own line below.
+                    if ui.available_width() >= TIME_READOUT_WIDTH {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(time_readout(ds));
+                        });
+                    } else {
+                        time_below = true;
+                    }
                 });
+                if time_below {
+                    ui.label(time_readout(ds));
+                }
                 self.overview_strip(ui, d, ds, sink);
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
-                    let play_label = if ds.playing { "❚❚" } else { "▶" };
+                    // Words, not ▶/❚❚: the bundled IBM Plex has no geometric shapes.
+                    let play_label = if ds.playing { "PAUSA" } else { "PLAY" };
                     if big_button(ui, play_label, keys.play, ds.playing).clicked() {
                         cmd(DeckCmd::TogglePlay);
                     }
@@ -1125,11 +1156,17 @@ impl RemixUi {
                     }
                     ui.vertical(|ui| {
                         meter(ui, state.master_level, 70.0);
-                        let limiting = state.limiter_reduction < 0.97;
-                        ui.label(
-                            RichText::new("LIM")
-                                .size(9.5)
-                                .color(if limiting { Color32::from_rgb(240, 84, 84) } else { SUBTLE }),
+                        // 0 means no state from the audio thread yet, not limiting.
+                        let limiting = state.limiter_reduction > 0.0 && state.limiter_reduction < 0.97;
+                        // extend(): the column is only as wide as the meter, so a
+                        // wrapping label would stack the letters vertically.
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("LIM")
+                                    .size(9.5)
+                                    .color(if limiting { Color32::from_rgb(240, 84, 84) } else { SUBTLE }),
+                            )
+                            .extend(),
                         );
                     });
                 });
@@ -1187,6 +1224,9 @@ impl RemixUi {
                 egui::ScrollArea::vertical()
                     .id_salt("library")
                     .max_height(220.0)
+                    // Inside the tab's own scroll area the space left below can be
+                    // tiny; without this the list collapses to two rows.
+                    .min_scrolled_height(200.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for e in &self.library.entries {
@@ -1196,7 +1236,7 @@ impl RemixUi {
                             ui.horizontal(|ui| {
                                 if e.is_dir {
                                     if ui
-                                        .add(egui::Button::new(RichText::new(format!("▸ {}", e.name)).color(MUTED)).frame(false))
+                                        .add(egui::Button::new(RichText::new(format!("› {}", e.name)).color(MUTED)).frame(false))
                                         .clicked()
                                     {
                                         enter = Some(e.path.clone());
@@ -1266,6 +1306,15 @@ struct DeckKeys {
 
 const EQ_IDS: [[&str; 3]; DECKS] = [["eq-a-low", "eq-a-mid", "eq-a-high"], ["eq-b-low", "eq-b-mid", "eq-b-high"]];
 const FILTER_IDS: [&str; DECKS] = ["filter-a", "filter-b"];
+
+/// Position / remaining time, e.g. `1:02.5 / -3:10.0`.
+fn time_readout(ds: &DeckState) -> RichText {
+    let remain = (ds.duration_secs - ds.position_secs).max(0.0);
+    RichText::new(format!("{} / -{}", fmt_time(ds.position_secs), fmt_time(remain)))
+        .monospace()
+        .size(12.0)
+        .color(MUTED)
+}
 
 fn big_button(ui: &mut Ui, label: &str, key: &str, active: bool) -> egui::Response {
     ui.add(
