@@ -11,13 +11,64 @@ use super::theme::{self, BG, FG, MUTED, SUBTLE, SURFACE};
 use super::widgets::{
     badge_pill, format_hz, format_ms, format_pct, icon_button, knob, volume_slider, waveform_select,
 };
+use super::remix_panel::RemixUi;
+use super::widgets::chip;
+use super::xy_panel::{XyUi, XyWrite};
 use crate::audio::{AudioHost, Gt100Hub, GuitarInput, MidiHub};
+use crate::settings::Settings;
+use crate::xy::XyTarget;
+use remix::{Band, CrossfaderCurve, DeckCmd, RemixCmd, RemixState, DECKS};
 use crate::synth::{
     midi_to_name, notes_from_preset, octave_base_midi, ArpDivision, ArpPattern, ArpPresetId,
     Command, FootLearn, SynthParams, MAX_OCTAVE, MIN_OCTAVE, VISIBLE_SEMITONES,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tab {
+    Synth,
+    Remix,
+}
+
+/// Values the XY pad can read, copied out so the pad can borrow them while
+/// the app is mutably borrowed.
+#[derive(Clone, Copy)]
+struct XyValues {
+    cutoff: f32,
+    resonance: f32,
+    bend: f32,
+    mix: super::remix_panel::MixUi,
+}
+
+impl XyValues {
+    fn get(&self, t: XyTarget) -> f32 {
+        let m = &self.mix;
+        match t {
+            XyTarget::None => 0.0,
+            XyTarget::MasterFilter => m.master_filter,
+            XyTarget::Crossfader => m.crossfader,
+            XyTarget::EchoMix => m.echo_mix,
+            XyTarget::EchoFeedback => m.echo_feedback,
+            XyTarget::EchoTime => m.echo_beats,
+            XyTarget::FilterA => m.filter[0],
+            XyTarget::FilterB => m.filter[1],
+            XyTarget::LowA => m.eq[0][Band::Low.index()],
+            XyTarget::LowB => m.eq[1][Band::Low.index()],
+            XyTarget::HighA => m.eq[0][Band::High.index()],
+            XyTarget::HighB => m.eq[1][Band::High.index()],
+            XyTarget::SynthCutoff => self.cutoff,
+            XyTarget::SynthResonance => self.resonance,
+            XyTarget::SynthBend => self.bend,
+        }
+    }
+}
+
 pub struct HelixApp {
+    tab: Tab,
+    settings: Settings,
+    settings_dirty_at: Option<f64>,
+    remix: RemixUi,
+    remix_state: RemixState,
+    xy: XyUi,
     audio: Option<AudioHost>,
     audio_err: Option<String>,
     midi: Option<MidiHub>,
@@ -66,7 +117,23 @@ impl HelixApp {
             Err(e) => (None, Some(e), None, None, None),
         };
 
+        let settings = Settings::load();
+        let sample_rate = audio.as_ref().map(|a| a.sample_rate as u32).unwrap_or(48_000);
+        let remix = RemixUi::new(sample_rate, &settings);
+        if let Some(a) = &audio {
+            if settings.sharp_crossfader {
+                a.send_remix(RemixCmd::SetCrossfaderCurve(CrossfaderCurve::Sharp));
+            }
+            remix.send_echo(&|c| a.send_remix(c));
+        }
+
         Self {
+            tab: Tab::Synth,
+            settings,
+            settings_dirty_at: None,
+            remix,
+            remix_state: RemixState::default(),
+            xy: XyUi::new(),
             audio,
             audio_err,
             midi,
@@ -113,88 +180,75 @@ impl HelixApp {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
-        ctx.input(|i| {
-            for event in &i.events {
-                if let egui::Event::Key {
-                    key,
-                    pressed,
-                    repeat,
-                    modifiers,
-                    ..
-                } = event
-                {
-                    if modifiers.ctrl || modifiers.mac_cmd || modifiers.alt {
-                        continue;
-                    }
-                    if *repeat {
-                        continue;
-                    }
-                    if *key == Key::Escape {
-                        self.send(Command::Panic);
-                        self.pointer_held.clear();
-                        self.key_held.clear();
-                        self.bend = 0.0;
-                        continue;
-                    }
-                    if typing {
-                        continue;
-                    }
-                    if *key == Key::Space {
-                        self.send(Command::SetPedal(*pressed));
-                        continue;
-                    }
-                    if *pressed && *key == Key::OpenBracket {
-                        self.shift_octave(-1);
-                        continue;
-                    }
-                    if *pressed && *key == Key::CloseBracket {
-                        self.shift_octave(1);
-                        continue;
-                    }
-                    if *key == Key::ArrowUp || *key == Key::ArrowDown {
-                        if *key == Key::ArrowUp {
-                            self.arrow_up = *pressed;
-                        } else {
-                            self.arrow_down = *pressed;
-                        }
-                        self.spring_from = None;
-                        let dir = match (self.arrow_up, self.arrow_down) {
-                            (true, false) => 1.0,
-                            (false, true) => -1.0,
-                            _ => 0.0,
-                        };
-                        if dir == 0.0 && !*pressed {
-                            self.spring_from = Some((self.bend, i.time));
-                        } else {
-                            self.bend = dir;
-                            self.send(Command::SetBend {
-                                amount: self.bend,
-                                range: self.bend_range,
-                            });
-                        }
-                        continue;
-                    }
-                    if let Some(offset) = computer_key_offset(*key) {
-                        if *pressed {
-                            if self.key_held.contains_key(key) {
-                                continue;
+        // Physical keys, so the map stays put on ABNT2 and other layouts.
+        let events: Vec<(Key, bool, bool, egui::Modifiers)> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                    } => Some((physical_key.unwrap_or(*key), *pressed, *repeat, *modifiers)),
+                    _ => None,
+                })
+                .collect()
+        });
+        let time = ctx.input(|i| i.time);
+        for (key, pressed, repeat, modifiers) in events {
+            if modifiers.ctrl || modifiers.mac_cmd || modifiers.alt || repeat {
+                continue;
+            }
+            if matches!(key, Key::F1 | Key::F2 | Key::F10 | Key::Escape) {
+                if !pressed {
+                    continue;
+                }
+                match key {
+                    Key::F1 => self.switch_tab(ctx, Tab::Synth),
+                    Key::F2 => self.switch_tab(ctx, Tab::Remix),
+                    Key::F10 => self.toggle_xy(ctx),
+                    _ => {
+                        if self.xy.active {
+                            self.exit_xy(ctx);
+                        } else if modifiers.shift && self.tab == Tab::Remix {
+                            for d in 0..DECKS {
+                                self.send_remix(RemixCmd::Deck(d, DeckCmd::Pause));
                             }
-                            let midi = octave_base_midi(self.octave).saturating_add(offset);
-                            self.key_held.insert(*key, midi);
-                            if self.arp.arp_on {
-                                self.arp.arp_preset = Some(ArpPresetId::Live);
-                            }
-                            self.send(Command::NoteOn {
-                                midi,
-                                velocity: 1.0,
-                            });
-                        } else if let Some(midi) = self.key_held.remove(key) {
-                            self.send(Command::NoteOff { midi });
+                        } else {
+                            self.panic();
                         }
                     }
                 }
+                continue;
             }
-        });
+            if typing {
+                continue;
+            }
+            match self.tab {
+                Tab::Synth => self.synth_key(key, pressed, time),
+                Tab::Remix => {
+                    let audio = &self.audio;
+                    let sink = |c: RemixCmd| {
+                        if let Some(a) = audio {
+                            a.send_remix(c);
+                        }
+                    };
+                    if self.remix.handle_key(
+                        key,
+                        pressed,
+                        modifiers.shift,
+                        time,
+                        &self.remix_state,
+                        &mut self.settings,
+                        &sink,
+                    ) {
+                        self.settings_dirty_at.get_or_insert(time);
+                    }
+                }
+            }
+        }
 
         if !self.dragging_bend && !self.arrow_up && !self.arrow_down {
             if let Some((from, t0)) = self.spring_from {
@@ -210,6 +264,206 @@ impl HelixApp {
                     self.spring_from = None;
                 }
             }
+        }
+    }
+
+    fn panic(&mut self) {
+        self.send(Command::Panic);
+        self.pointer_held.clear();
+        self.key_held.clear();
+        self.bend = 0.0;
+    }
+
+    fn synth_key(&mut self, key: Key, pressed: bool, time: f64) {
+        if key == Key::Space {
+            self.send(Command::SetPedal(pressed));
+            return;
+        }
+        if pressed && key == Key::OpenBracket {
+            self.shift_octave(-1);
+            return;
+        }
+        if pressed && key == Key::CloseBracket {
+            self.shift_octave(1);
+            return;
+        }
+        if key == Key::ArrowUp || key == Key::ArrowDown {
+            if key == Key::ArrowUp {
+                self.arrow_up = pressed;
+            } else {
+                self.arrow_down = pressed;
+            }
+            self.spring_from = None;
+            let dir = match (self.arrow_up, self.arrow_down) {
+                (true, false) => 1.0,
+                (false, true) => -1.0,
+                _ => 0.0,
+            };
+            if dir == 0.0 && !pressed {
+                self.spring_from = Some((self.bend, time));
+            } else {
+                self.bend = dir;
+                self.send(Command::SetBend {
+                    amount: self.bend,
+                    range: self.bend_range,
+                });
+            }
+            return;
+        }
+        if let Some(offset) = computer_key_offset(key) {
+            if pressed {
+                if self.key_held.contains_key(&key) {
+                    return;
+                }
+                let midi = octave_base_midi(self.octave).saturating_add(offset);
+                self.key_held.insert(key, midi);
+                if self.arp.arp_on {
+                    self.arp.arp_preset = Some(ArpPresetId::Live);
+                }
+                self.send(Command::NoteOn {
+                    midi,
+                    velocity: 1.0,
+                });
+            } else if let Some(midi) = self.key_held.remove(&key) {
+                self.send(Command::NoteOff { midi });
+            }
+        }
+    }
+
+    fn send_remix(&self, cmd: RemixCmd) {
+        if let Some(audio) = &self.audio {
+            audio.send_remix(cmd);
+        }
+    }
+
+    fn switch_tab(&mut self, ctx: &egui::Context, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        if self.xy.active {
+            self.exit_xy(ctx);
+        }
+        match self.tab {
+            Tab::Synth => {
+                let held: Vec<u8> = self.key_held.drain().map(|(_, m)| m).collect();
+                for midi in held {
+                    self.send(Command::NoteOff { midi });
+                }
+                if self.arrow_up || self.arrow_down {
+                    self.arrow_up = false;
+                    self.arrow_down = false;
+                    self.spring_from = Some((self.bend, ctx.input(|i| i.time)));
+                }
+                self.send(Command::SetPedal(false));
+            }
+            Tab::Remix => {
+                let audio = &self.audio;
+                self.remix.release_keys(&|c: RemixCmd| {
+                    if let Some(a) = audio {
+                        a.send_remix(c);
+                    }
+                });
+            }
+        }
+        self.tab = tab;
+    }
+
+    fn xy_targets(&self) -> [XyTarget; 2] {
+        match self.tab {
+            Tab::Synth => self.settings.xy.synth,
+            Tab::Remix => self.settings.xy.remix,
+        }
+    }
+
+    fn xy_values(&self) -> XyValues {
+        XyValues {
+            cutoff: self.params.cutoff,
+            resonance: self.params.resonance,
+            bend: self.bend,
+            mix: self.remix.mix,
+        }
+    }
+
+    fn toggle_xy(&mut self, ctx: &egui::Context) {
+        let targets = self.xy_targets();
+        let vals = self.xy_values();
+        let writes = self
+            .xy
+            .toggle(ctx, targets, self.settings.xy.spring_back, &|t| vals.get(t));
+        for w in writes {
+            self.apply_xy(w);
+        }
+    }
+
+    fn exit_xy(&mut self, ctx: &egui::Context) {
+        let writes = self.xy.exit(ctx, self.settings.xy.spring_back);
+        for w in writes {
+            self.apply_xy(w);
+        }
+    }
+
+    fn apply_xy(&mut self, w: XyWrite) {
+        let v = w.value;
+        let m = &mut self.remix.mix;
+        let cmd = match w.target {
+            XyTarget::None => None,
+            XyTarget::SynthCutoff => {
+                self.params.cutoff = v;
+                self.send(Command::SetCutoff(v));
+                None
+            }
+            XyTarget::SynthResonance => {
+                self.params.resonance = v;
+                self.send(Command::SetResonance(v));
+                None
+            }
+            XyTarget::SynthBend => {
+                self.bend = v;
+                self.spring_from = None;
+                self.send(Command::SetBend {
+                    amount: v,
+                    range: self.bend_range,
+                });
+                None
+            }
+            XyTarget::MasterFilter => {
+                m.master_filter = v;
+                Some(RemixCmd::SetMasterFilter(v))
+            }
+            XyTarget::Crossfader => {
+                m.crossfader = v;
+                Some(RemixCmd::SetCrossfader(v))
+            }
+            XyTarget::EchoMix | XyTarget::EchoFeedback | XyTarget::EchoTime => {
+                match w.target {
+                    XyTarget::EchoMix => m.echo_mix = v,
+                    XyTarget::EchoFeedback => m.echo_feedback = v,
+                    _ => m.echo_beats = v,
+                }
+                Some(RemixCmd::SetEcho {
+                    mix: m.echo_mix,
+                    feedback: m.echo_feedback,
+                    beats: m.echo_beats,
+                })
+            }
+            XyTarget::FilterA | XyTarget::FilterB => {
+                let deck = (w.target == XyTarget::FilterB) as usize;
+                m.filter[deck] = v;
+                Some(RemixCmd::SetFilter { deck, pos: v })
+            }
+            XyTarget::LowA | XyTarget::LowB | XyTarget::HighA | XyTarget::HighB => {
+                let deck = matches!(w.target, XyTarget::LowB | XyTarget::HighB) as usize;
+                let band = if matches!(w.target, XyTarget::LowA | XyTarget::LowB) {
+                    Band::Low
+                } else {
+                    Band::High
+                };
+                m.eq[deck][band.index()] = v;
+                Some(RemixCmd::SetEq { deck, band, gain: v })
+            }
+        };
+        if let Some(c) = cmd {
+            self.send_remix(c);
         }
     }
 
@@ -229,9 +483,50 @@ impl HelixApp {
 impl eframe::App for HelixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
+        if let Some(a) = &self.audio {
+            a.drain_trash();
+            self.remix_state = a.remix_state();
+        }
         self.handle_keys(ctx);
 
         let now = ctx.input(|i| i.time);
+        {
+            let audio = &self.audio;
+            let sink = |c: RemixCmd| {
+                if let Some(a) = audio {
+                    a.send_remix(c);
+                }
+            };
+            if self.remix.tick(now, &self.remix_state, &mut self.settings, &sink) {
+                self.settings_dirty_at.get_or_insert(now);
+            }
+        }
+        self.remix.handle_dropped_files(ctx, &self.remix_state, now);
+        if self.tab == Tab::Synth && ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+            self.tab = Tab::Remix;
+        }
+
+        let targets = self.xy_targets();
+        let vals = self.xy_values();
+        let writes = self.xy.update(
+            ctx,
+            targets,
+            self.settings.xy.spring_back,
+            self.settings.xy.sensitivity,
+            &|t| vals.get(t),
+        );
+        for w in writes {
+            self.apply_xy(w);
+        }
+
+        if let Some(t) = self.settings_dirty_at {
+            if now - t > 1.5 {
+                if let Err(e) = self.settings.save() {
+                    eprintln!("helix: could not save settings: {e}");
+                }
+                self.settings_dirty_at = None;
+            }
+        }
         if now - self.midi_poll_at > 0.8 {
             self.midi_poll_at = now;
             if let Some(midi) = self.midi.as_mut() {
@@ -300,35 +595,85 @@ impl eframe::App for HelixApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        self.paint_ui(ui, &snap, &active, &pooled);
+                        self.paint_header(ui, now);
+                        match self.tab {
+                            Tab::Synth => self.paint_ui(ui, &snap, &active, &pooled),
+                            Tab::Remix => {
+                                let audio = &self.audio;
+                                let sink = |c: RemixCmd| {
+                                    if let Some(a) = audio {
+                                        a.send_remix(c);
+                                    }
+                                };
+                                if self.remix.show(ui, &self.remix_state, &mut self.settings, &sink, now) {
+                                    self.settings_dirty_at.get_or_insert(now);
+                                }
+                            }
+                        }
                     });
             });
+
+        let vals = self.xy_values();
+        self.xy.overlay(ctx, self.xy_targets(), &|t| vals.get(t));
+    }
+}
+
+impl Drop for HelixApp {
+    fn drop(&mut self) {
+        if let Err(e) = self.settings.save() {
+            eprintln!("helix: could not save settings: {e}");
+        }
     }
 }
 
 impl HelixApp {
-    fn paint_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        snap: &crate::audio::Snapshot,
-        active: &HashSet<u8>,
-        pooled: &HashSet<u8>,
-    ) {
+    fn paint_header(&mut self, ui: &mut egui::Ui, now: f64) {
+        let mut switch_to = None;
+        let mut toggle_xy = false;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("ANALOG KEYBOARD")
+                    egui::RichText::new("SYNTH · REMIX")
                         .size(10.5)
                         .color(SUBTLE)
                         .extra_letter_spacing(2.4),
                 );
                 ui.label(egui::RichText::new("Helix").heading().color(FG));
             });
+            ui.add_space(18.0);
+            for (tab, label) in [(Tab::Synth, "Synth · F1"), (Tab::Remix, "Remix · F2")] {
+                if chip(ui, label, self.tab == tab).clicked() {
+                    switch_to = Some(tab);
+                }
+            }
+            ui.add_space(8.0);
+            if chip(ui, "XY · F10", self.xy.active).clicked() {
+                toggle_xy = true;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 midi_picker(ui, self);
             });
         });
-        ui.add_space(10.0);
+        let ctx = ui.ctx().clone();
+        if let Some(tab) = switch_to {
+            self.switch_tab(&ctx, tab);
+        }
+        if toggle_xy {
+            self.toggle_xy(&ctx);
+        }
+        ui.add_space(4.0);
+        let xy = &mut self.settings.xy;
+        let targets = match self.tab {
+            Tab::Synth => &mut xy.synth,
+            Tab::Remix => &mut xy.remix,
+        };
+        if self
+            .xy
+            .settings_row(ui, targets, &mut xy.spring_back, &mut xy.sensitivity)
+        {
+            self.settings_dirty_at.get_or_insert(now);
+        }
+        ui.add_space(8.0);
 
         if let Some(err) = &self.audio_err {
             ui.colored_label(
@@ -336,7 +681,15 @@ impl HelixApp {
                 format!("Audio: {err}"),
             );
         }
+    }
 
+    fn paint_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        snap: &crate::audio::Snapshot,
+        active: &HashSet<u8>,
+        pooled: &HashSet<u8>,
+    ) {
         egui::Frame::new()
             .fill(SURFACE)
             .stroke(theme::panel_stroke())
@@ -597,7 +950,7 @@ impl HelixApp {
         ui.add_space(10.0);
         ui.label(
             egui::RichText::new(
-                "Fuzz Factory sits on the output (keys + guitar). On, then play Z/Q or guitar. Stab down = squeal (no input needed). Comp is the pitch/treble of that wave. Pedais: toque (não segure). Learn + pisa o CTL. CC 80 Whammy, 81 Fuzz. Whammy drives GT-100 P.SHIFT (−12 / 0 / +12). Space sustains, [ ] octave, Esc panic.",
+                "Fuzz Factory sits on the output (keys + guitar). On, then play Z/Q or guitar. Stab down = squeal (no input needed). Comp is the pitch/treble of that wave. Pedais: toque (não segure). Learn + pisa o CTL. CC 80 Whammy, 81 Fuzz. Whammy drives GT-100 P.SHIFT (−12 / 0 / +12). Space sustains, [ ] octave, Esc panic. F1 Synth · F2 Remix · F10 XY pad.",
             )
             .size(12.0)
             .color(MUTED),

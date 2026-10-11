@@ -35,7 +35,7 @@ jobs:
       - name: ALSA headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - run: cargo test --release
+      - run: cargo test --workspace --release
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
