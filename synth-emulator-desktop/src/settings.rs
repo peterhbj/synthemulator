@@ -63,9 +63,21 @@ impl Default for XySettings {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TrackMemo {
+    #[serde(deserialize_with = "de_hot_cues")]
     pub hot_cues: [Option<f64>; remix::HOT_CUES],
     /// Manual / tapped tempo that replaces the detected one.
     pub bpm: Option<f64>,
+}
+
+/// Saved files may hold fewer slots (four before the extra ones). Missing
+/// slots stay empty, instead of the whole memo failing to load.
+fn de_hot_cues<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[Option<f64>; remix::HOT_CUES], D::Error> {
+    let saved = Vec::<Option<f64>>::deserialize(d)?;
+    let mut cues = [None; remix::HOT_CUES];
+    for (slot, cue) in cues.iter_mut().zip(saved) {
+        *slot = cue;
+    }
+    Ok(cues)
 }
 
 impl TrackMemo {
@@ -208,6 +220,16 @@ mod tests {
         let s = Settings::load_from(&path);
         assert_eq!(s.auto_beats, 8.0);
         assert_eq!(s.xy, XySettings::default());
+    }
+
+    #[test]
+    fn memo_saved_with_four_hot_cue_slots_still_loads() {
+        let old = r#"{"bpm": 124.0, "hot_cues": [1.5, null, 3.0, null]}"#;
+        let memo: TrackMemo = serde_json::from_str(old).expect("old memo loads");
+        assert_eq!(memo.bpm, Some(124.0));
+        assert_eq!(memo.hot_cues[0], Some(1.5));
+        assert_eq!(memo.hot_cues[2], Some(3.0));
+        assert!(memo.hot_cues[4..].iter().all(Option::is_none));
     }
 
     #[test]

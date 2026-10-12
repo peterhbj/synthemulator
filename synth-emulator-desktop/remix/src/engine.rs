@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::deck::{Deck, DeckCmd, DeckState};
+use crate::deck::{Deck, DeckCmd, DeckState, TEMPO_RANGES};
 use crate::dsp::{
     crossfader_gains, Band, CrossfaderCurve, DjFilter, Echo, Limiter, Smoother, ThreeBandEq,
     EQ_MAX_GAIN,
@@ -49,8 +49,14 @@ pub enum RemixCmd {
         fallback_secs: f32,
     },
     CancelAutoTransition,
-    /// Sync `deck` to the other deck (tempo and phase).
+    /// Sync `deck` to the other deck (tempo and phase). When both decks have
+    /// tempo this links them: `StepBpm` then moves both together, until a
+    /// load, eject, tempo fader, tempo range or BPM edit on either deck.
     SyncDeck(usize),
+    /// Move the tempo by `delta` BPM, landing on whole BPM (127.6 + 1 = 128).
+    /// Acts on the tempo deck (see `RemixState::tempo_deck`), or on both
+    /// decks while they are linked, keeping their ratio and phase.
+    StepBpm(f64),
     /// -1..=1 on the master bus.
     SetMasterFilter(f32),
     /// Echo send 0..=1, feedback 0..=0.95, time in beats of the master deck
@@ -89,6 +95,12 @@ pub struct RemixState {
     pub auto: Option<AutoTransitionState>,
     /// Deck currently carrying the mix (playing and loudest), if any.
     pub master_deck: Option<usize>,
+    /// Deck whose tempo the BPM readout shows and `StepBpm` moves: the master
+    /// deck when it has tempo, else a playing deck with tempo, else any deck
+    /// with tempo.
+    pub tempo_deck: Option<usize>,
+    /// The decks are linked by a sync (see `RemixCmd::SyncDeck`).
+    pub synced: bool,
     pub master_filter: f32,
     pub echo_mix: f32,
     pub echo_feedback: f32,
@@ -118,6 +130,8 @@ const ECHO_MIN_BEATS: f32 = 1.0 / 16.0;
 const ECHO_MAX_BEATS: f32 = 4.0;
 const ECHO_MAX_FEEDBACK: f32 = 0.95;
 const MASTER_GAIN_MAX: f32 = 1.5;
+/// Tempos this close to a whole BPM count as on it for `StepBpm`.
+const BPM_SNAP_EPS: f64 = 1e-6;
 /// Tempo used by the echo when the master deck has none.
 const FALLBACK_BPM: f64 = 120.0;
 /// The echo time is rechecked every this many frames.
@@ -247,6 +261,8 @@ pub struct RemixEngine {
     master_level: f32,
     /// Per-frame multiplier of the peak meters.
     meter_decay: f32,
+    /// Tempo link set by a sync, see `RemixCmd::SyncDeck`.
+    linked: bool,
 }
 
 impl RemixEngine {
@@ -284,6 +300,7 @@ impl RemixEngine {
             limiter: Limiter::new(fs),
             master_level: 0.0,
             meter_decay: (-1.0 / (METER_DECAY_SECS * fs)).exp(),
+            linked: false,
         }
     }
 
@@ -292,6 +309,9 @@ impl RemixEngine {
     pub fn handle(&mut self, cmd: RemixCmd) -> Option<Arc<Track>> {
         match cmd {
             RemixCmd::Deck(deck, cmd) => {
+                if deck < DECKS && breaks_link(&cmd) {
+                    self.linked = false;
+                }
                 return match self.channels.get_mut(deck) {
                     Some(ch) => ch.deck.handle(cmd),
                     // Not a deck: hand a loaded track back so it is freed off the audio thread.
@@ -352,6 +372,7 @@ impl RemixEngine {
             }
             RemixCmd::CancelAutoTransition => self.cancel_transition(),
             RemixCmd::SyncDeck(deck) => self.sync_deck(deck),
+            RemixCmd::StepBpm(delta) => self.step_bpm(delta),
             RemixCmd::SetMasterFilter(pos) => {
                 if let Some(p) = clamp_value(pos, -1.0, 1.0) {
                     self.master_filter_pos = p;
@@ -442,6 +463,8 @@ impl RemixEngine {
                 progress: (t.elapsed / t.total) as f32,
             }),
             master_deck: self.master_deck(),
+            tempo_deck: self.tempo_deck(),
+            synced: self.linked,
             master_filter: self.master_filter_pos,
             echo_mix: self.echo_mix,
             echo_feedback: self.echo_feedback,
@@ -518,10 +541,61 @@ impl RemixEngine {
         let Some(bpm) = self.channels[other].deck.effective_bpm() else {
             return;
         };
+        if self.channels[deck].deck.tempo_bpm().is_none() {
+            return;
+        }
         let phase = self.phase_of(other);
         self.channels[deck]
             .deck
             .handle(DeckCmd::Sync { bpm, phase });
+        self.linked = true;
+    }
+
+    /// See `RemixState::tempo_deck`.
+    fn tempo_deck(&self) -> Option<usize> {
+        let has_tempo = |d: usize| self.channels[d].deck.tempo_bpm().is_some();
+        self.master_deck()
+            .filter(|d| has_tempo(*d))
+            .or_else(|| (0..DECKS).find(|d| has_tempo(*d) && self.channels[*d].deck.is_playing()))
+            .or_else(|| (0..DECKS).find(|d| has_tempo(*d)))
+    }
+
+    fn step_bpm(&mut self, delta: f64) {
+        if !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        let Some(lead) = self.tempo_deck() else {
+            return;
+        };
+        let Some(from) = self.channels[lead].deck.tempo_bpm().filter(|b| *b > 0.0) else {
+            return;
+        };
+        // Off-grid tempos snap to the next whole BPM in the step's direction.
+        let to = if delta > 0.0 {
+            (from + BPM_SNAP_EPS).floor() + delta
+        } else {
+            (from - BPM_SNAP_EPS).ceil() + delta
+        };
+        let mut factor = to / from;
+        let decks: [bool; DECKS] = std::array::from_fn(|d| {
+            d == lead || (self.linked && self.channels[d].deck.tempo_bpm().is_some())
+        });
+        // Linked decks move by the same factor, so one deck at the end of its
+        // range holds the other back and the link stays exact.
+        let widest = f64::from(TEMPO_RANGES[TEMPO_RANGES.len() - 1]);
+        for d in (0..DECKS).filter(|d| decks[*d]) {
+            let speed = self.channels[d].deck.tempo_speed();
+            factor = factor.clamp((1.0 - widest) / speed, (1.0 + widest) / speed);
+        }
+        if !factor.is_finite() || (factor - 1.0).abs() < 1e-12 {
+            return;
+        }
+        for d in (0..DECKS).filter(|d| decks[*d]) {
+            let speed = self.channels[d].deck.tempo_speed();
+            self.channels[d]
+                .deck
+                .handle(DeckCmd::SetTempoSpeed(speed * factor));
+        }
     }
 
     fn start_transition(&mut self, to: usize, beats: f32, fallback_secs: f32) {
@@ -547,6 +621,7 @@ impl RemixEngine {
             if let (Some(bpm), true) = (from_bpm, to_has_tempo) {
                 let phase = self.phase_of(from);
                 self.channels[to].deck.handle(DeckCmd::Sync { bpm, phase });
+                self.linked = true;
             }
         }
 
@@ -605,11 +680,25 @@ impl RemixEngine {
     }
 }
 
+/// Deck commands that change a deck's tempo or track, ending a sync link.
+fn breaks_link(cmd: &DeckCmd) -> bool {
+    matches!(
+        cmd,
+        DeckCmd::Load(_)
+            | DeckCmd::Eject
+            | DeckCmd::SetTempoFader(_)
+            | DeckCmd::SetTempoRange(_)
+            | DeckCmd::SetTempoSpeed(_)
+            | DeckCmd::Sync { .. }
+            | DeckCmd::SetBpm(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::Analysis;
-    use crate::deck::{HOT_CUES, TEMPO_RANGES};
+    use crate::deck::HOT_CUES;
     use crate::dsp::LIMITER_CEILING;
     use std::f64::consts::TAU;
 
@@ -1205,6 +1294,134 @@ mod tests {
     }
 
     #[test]
+    fn step_bpm_moves_the_tempo_deck_to_whole_bpm() {
+        let mut eng = RemixEngine::new(SR as f32);
+        assert_eq!(eng.state().tempo_deck, None);
+        eng.handle(RemixCmd::StepBpm(1.0)); // nothing loaded: no-op
+        eng.handle(RemixCmd::Deck(
+            0,
+            DeckCmd::Load(track(3.0, Some(127.6), sine(440.0, 0.5))),
+        ));
+        assert_eq!(
+            eng.state().tempo_deck,
+            Some(0),
+            "a paused deck with tempo still counts"
+        );
+        eng.handle(RemixCmd::StepBpm(1.0));
+        assert!((eng.state().decks[0].bpm.unwrap() - 128.0).abs() < 1e-9);
+        eng.handle(RemixCmd::StepBpm(1.0));
+        assert!((eng.state().decks[0].bpm.unwrap() - 129.0).abs() < 1e-9);
+        eng.handle(RemixCmd::StepBpm(-1.0));
+        eng.handle(RemixCmd::StepBpm(-1.0));
+        assert!((eng.state().decks[0].bpm.unwrap() - 127.0).abs() < 1e-9);
+        // The far end of the widest range holds.
+        for _ in 0..200 {
+            eng.handle(RemixCmd::StepBpm(1.0));
+        }
+        assert!((eng.state().decks[0].speed - 1.5).abs() < 1e-9);
+        eng.handle(RemixCmd::StepBpm(f64::NAN));
+        assert!((eng.state().decks[0].speed - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn step_bpm_follows_the_master_deck_when_not_synced() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(3.0, Some(120.0), sine(440.0, 0.5)));
+        load_play(&mut eng, 1, track(3.0, Some(130.0), sine(660.0, 0.5)));
+        eng.handle(RemixCmd::SetCrossfader(1.0));
+        let s = eng.state();
+        assert_eq!(s.tempo_deck, Some(1));
+        assert!(!s.synced);
+        eng.handle(RemixCmd::StepBpm(1.0));
+        let s = eng.state();
+        assert!((s.decks[1].bpm.unwrap() - 131.0).abs() < 1e-9);
+        assert_eq!(s.decks[0].speed, 1.0, "the other deck stays put");
+    }
+
+    #[test]
+    fn sync_links_the_decks_so_step_bpm_moves_both() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(3.0, Some(120.0), sine(440.0, 0.5)));
+        load_play(&mut eng, 1, track(3.0, Some(126.0), sine(660.0, 0.5)));
+        eng.handle(RemixCmd::SyncDeck(1));
+        assert!(eng.state().synced);
+        let phase_gap = |eng: &RemixEngine| {
+            let s = eng.state();
+            let d = s.decks[0].beat_phase.unwrap() - s.decks[1].beat_phase.unwrap();
+            (d + 0.5).rem_euclid(1.0) - 0.5
+        };
+        let gap = phase_gap(&eng);
+        eng.handle(RemixCmd::StepBpm(1.0));
+        eng.handle(RemixCmd::StepBpm(1.0));
+        let s = eng.state();
+        assert!((s.decks[0].bpm.unwrap() - 122.0).abs() < 1e-9);
+        assert!((s.decks[1].bpm.unwrap() - 122.0).abs() < 1e-9);
+        render(&mut eng, SR as usize);
+        assert!((phase_gap(&eng) - gap).abs() < 1e-3, "phases stay locked");
+
+        // Linked decks stop together at the end of the range.
+        for _ in 0..200 {
+            eng.handle(RemixCmd::StepBpm(-1.0));
+        }
+        let s = eng.state();
+        assert!((s.decks[0].bpm.unwrap() - s.decks[1].bpm.unwrap()).abs() < 1e-9);
+
+        // Touching a tempo fader ends the link.
+        eng.handle(RemixCmd::Deck(0, DeckCmd::SetTempoFader(0.0)));
+        assert!(!eng.state().synced);
+        let before = eng.state().decks[1].speed;
+        eng.handle(RemixCmd::SetCrossfader(0.0));
+        eng.handle(RemixCmd::StepBpm(1.0));
+        assert_eq!(eng.state().decks[1].speed, before);
+
+        // A sync to a deck without tempo does not link.
+        eng.handle(RemixCmd::Deck(
+            0,
+            DeckCmd::Load(track(3.0, None, sine(440.0, 0.5))),
+        ));
+        eng.handle(RemixCmd::SyncDeck(1));
+        assert!(!eng.state().synced);
+        // Neither does syncing a deck without tempo.
+        eng.handle(RemixCmd::SyncDeck(0));
+        assert!(!eng.state().synced);
+    }
+
+    #[test]
+    fn load_and_bpm_edits_end_the_link() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(3.0, Some(120.0), sine(440.0, 0.5)));
+        load_play(&mut eng, 1, track(3.0, Some(126.0), sine(660.0, 0.5)));
+        for cmd in [
+            DeckCmd::SetBpm(125.0),
+            DeckCmd::SetTempoRange(0.16),
+            DeckCmd::Eject,
+        ] {
+            eng.handle(RemixCmd::SyncDeck(1));
+            assert!(eng.state().synced);
+            eng.handle(RemixCmd::Deck(1, cmd.clone()));
+            assert!(!eng.state().synced, "{cmd:?}");
+        }
+        // Play, cue and hot cues keep it.
+        eng.handle(RemixCmd::Deck(
+            1,
+            DeckCmd::Load(track(3.0, Some(126.0), sine(660.0, 0.5))),
+        ));
+        eng.handle(RemixCmd::SyncDeck(1));
+        for cmd in [
+            DeckCmd::Play,
+            DeckCmd::HotCue(5),
+            DeckCmd::Cue,
+            DeckCmd::Nudge(1.0),
+        ] {
+            eng.handle(RemixCmd::Deck(1, cmd));
+        }
+        assert!(eng.state().synced);
+        // A command for a deck that does not exist changes nothing.
+        eng.handle(RemixCmd::Deck(7, DeckCmd::Eject));
+        assert!(eng.state().synced);
+    }
+
+    #[test]
     fn deck_commands_are_forwarded_and_replaced_tracks_come_back() {
         let mut eng = RemixEngine::new(SR as f32);
         let first = track(1.0, Some(120.0), sine(440.0, 0.5));
@@ -1342,7 +1559,7 @@ mod tests {
     }
 
     fn random_deck_cmd(p: &mut Prng, tracks: &[Arc<Track>; 2]) -> DeckCmd {
-        match p.pick(21) {
+        match p.pick(22) {
             0 => DeckCmd::Load(tracks[p.pick(2) as usize].clone()),
             1 => DeckCmd::Eject,
             2 => DeckCmd::TogglePlay,
@@ -1351,7 +1568,7 @@ mod tests {
             5 => DeckCmd::Cue,
             6 => DeckCmd::HotCue(p.pick(HOT_CUES as u64 + 2) as usize),
             7 => DeckCmd::ClearHotCue(p.pick(HOT_CUES as u64 + 2) as usize),
-            8 => DeckCmd::SetHotCues([p.opt_f64(), p.opt_f64(), p.opt_f64(), p.opt_f64()]),
+            8 => DeckCmd::SetHotCues(std::array::from_fn(|_| p.opt_f64())),
             9 => DeckCmd::BeatLoop(p.value()),
             10 => DeckCmd::ExitLoop,
             11 => DeckCmd::LoopHalve,
@@ -1366,6 +1583,7 @@ mod tests {
                 phase: p.opt_f64(),
             },
             19 => DeckCmd::SetBpm(f64::from(p.value()) * 100.0),
+            20 => DeckCmd::SetTempoSpeed(f64::from(p.value())),
             _ => DeckCmd::SetGridAnchorHere,
         }
     }
@@ -1373,7 +1591,7 @@ mod tests {
     fn random_cmd(p: &mut Prng, tracks: &[Arc<Track>; 2]) -> RemixCmd {
         let deck = p.pick(3) as usize;
         let band = Band::ALL[p.pick(3) as usize];
-        match p.pick(13) {
+        match p.pick(14) {
             0 => RemixCmd::Deck(deck, random_deck_cmd(p, tracks)),
             1 => RemixCmd::SetEq {
                 deck,
@@ -1406,6 +1624,7 @@ mod tests {
             },
             8 => RemixCmd::CancelAutoTransition,
             9 => RemixCmd::SyncDeck(deck),
+            13 => RemixCmd::StepBpm(f64::from(p.value()) * 4.0 - 2.0),
             10 => RemixCmd::SetMasterFilter(p.value()),
             11 => RemixCmd::SetEcho {
                 mix: p.value(),
