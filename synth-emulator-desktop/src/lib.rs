@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod log;
 pub mod settings;
 pub mod synth;
 pub mod ui;

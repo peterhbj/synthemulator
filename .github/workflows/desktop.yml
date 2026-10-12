@@ -37,6 +37,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo test --workspace --release
       - run: cargo build --release
+      - name: helix.exe must not need the VC++ runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents target\release\helix.exe | Out-String
+          $deps
+          if ($deps -match 'VCRUNTIME|api-ms-win-crt|MSVCP') { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: helix-${{ runner.os }}

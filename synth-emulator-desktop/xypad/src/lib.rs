@@ -28,10 +28,22 @@ pub trait Touchpad: Send {
     fn name(&self) -> &str;
     /// Most recent finger state. Cheap; call every frame.
     fn latest(&self) -> Touch;
-    /// Grab: the touchpad stops moving the system cursor (and stops
-    /// clicking) until released. Release must always succeed.
+    /// Grab: the touchpad stops moving the system cursor until released.
+    /// Whether taps and clicks stop too depends on the backend, see
+    /// [`Touchpad::grab_stops_clicks`]. Release must always succeed.
     fn set_grab(&mut self, grab: bool) -> Result<(), String>;
     fn grabbed(&self) -> bool;
+    /// True when a grab also swallows taps, clicks and scrolling (Linux
+    /// EVIOCGRAB). False when they still reach the window under the pinned
+    /// cursor (Windows), so the app must shield its own widgets.
+    fn grab_stops_clicks(&self) -> bool {
+        false
+    }
+    /// False once the device is gone (unplugged, re-enumerated after resume)
+    /// or its reader thread has ended; the app should open it again.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// Open the built-in touchpad. `Err` carries a short, user-facing reason in
