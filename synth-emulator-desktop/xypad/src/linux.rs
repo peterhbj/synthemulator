@@ -4,28 +4,49 @@
 //! `evdev::enumerate`, which silently drops nodes it cannot open. That lets
 //! "every node refused" (no permission) be told apart from "no touchpad".
 //!
+//! Nodes are probed in event-number order, and among touchpads the built-in
+//! one wins: internal buses before USB and Bluetooth, game-pad touchpads
+//! (DualShock 4, DualSense) only when nothing else exists (`pick_index`).
+//!
 //! The chosen device is opened non-blocking and owned by one reader thread.
 //! That thread is also the only one that issues `EVIOCGRAB`, on the same fd
 //! it reads from: grabbing through another fd would starve the reader. Each
 //! poll makes the grab match the request, reads up to a few batches, then
 //! sleeps 4 ms.
+//!
+//! The grab is held only while the app keeps polling [`Touchpad::latest`]:
+//! with no poll for [`POLL_TIMEOUT`] (500 ms) the UI has stopped drawing
+//! (minimised on Wayland, stalled), so the reader ungrabs until polls resume
+//! and grabs again if the grab is still requested. The reader thread ends
+//! when the device goes away (ENODEV after a re-enumeration, unplug); from
+//! then on [`Touchpad::is_alive`] is false and the app opens the touchpad
+//! again.
 
 use super::{normalize_axis, Touch, Touchpad};
-use evdev::{AbsoluteAxisCode, Device, DeviceState, EventSummary, InputEvent, KeyCode, PropType};
+use evdev::{
+    AbsoluteAxisCode, BusType, Device, DeviceState, EventSummary, InputEvent, KeyCode, PropType,
+};
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const PERMISSION_MSG: &str =
     "Sem permissão para ler o touchpad. Rode: sudo usermod -aG input $USER e faça logout/login.";
 const NOT_FOUND_MSG: &str = "Nenhum touchpad encontrado.";
+/// `set_grab(true)` after the reader thread has ended.
+const GONE_MSG: &str = "O touchpad foi desconectado. Ative o XY de novo.";
 
 /// Idle wait between polls of the non-blocking device.
 const POLL_INTERVAL: Duration = Duration::from_millis(4);
+
+/// The app polls [`Touchpad::latest`] every frame while the pad is in use.
+/// No poll for this long means the UI stopped drawing, so the reader lets go
+/// of the device until polls resume.
+const POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Reads per poll before the reader sleeps. A longer burst carries over to the
 /// next poll, which keeps one poll from running on for long.
@@ -59,6 +80,14 @@ struct Shared {
     /// Grab state the reader thread has actually applied.
     grabbed: AtomicBool,
     stop: AtomicBool,
+    /// The reader thread is running. Cleared on every way out of it
+    /// ([`ReaderExit`]).
+    alive: AtomicBool,
+    /// Start of the heartbeat clock.
+    origin: Instant,
+    /// Milliseconds since `origin` of the app's last `latest()` or grab
+    /// request.
+    last_poll_ms: AtomicU64,
 }
 
 impl Shared {
@@ -70,6 +99,9 @@ impl Shared {
             grab_requested: AtomicBool::new(false),
             grabbed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            alive: AtomicBool::new(true),
+            origin: Instant::now(),
+            last_poll_ms: AtomicU64::new(0),
         }
     }
 
@@ -80,6 +112,29 @@ impl Shared {
             touching: self.touching.load(Ordering::Relaxed),
         }
     }
+
+    /// Milliseconds on the heartbeat clock.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record an app poll now.
+    fn stamp_poll(&self) {
+        self.last_poll_ms.store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Time from the app's last poll to `now_ms`. A poll stamped after
+    /// `now_ms` was read counts as just now.
+    fn since_last_poll(&self, now_ms: u64) -> Duration {
+        Duration::from_millis(now_ms.saturating_sub(self.last_poll_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// Whether the reader should hold `EVIOCGRAB`: the app asked for it and
+/// polled within [`POLL_TIMEOUT`]. A UI that stopped drawing can then never
+/// keep the touchpad away from the rest of the desktop.
+fn grab_wanted(requested: bool, since_last_poll: Duration) -> bool {
+    requested && since_last_poll < POLL_TIMEOUT
 }
 
 /// What the classifier needs to know about a device, as plain flags.
@@ -107,13 +162,52 @@ fn name_preferred(name: &str) -> bool {
     NAME_HINTS.iter().any(|hint| lower.contains(hint))
 }
 
-/// Index of the candidate to use: the first with a preferred name, otherwise
-/// the first candidate. `None` when there are no candidates.
-fn pick_index(names: &[&str]) -> Option<usize> {
-    names
+/// A game pad's touchpad, such as the DualShock 4's or the DualSense's
+/// ("... Wireless Controller Touchpad"). It passes `is_touchpad` too.
+fn is_game_pad(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("controller")
+}
+
+/// Lower is more likely the built-in touchpad: internal buses (i8042 PS/2,
+/// I2C HID, host, SPI, and RMI4 over SMBus), then anything else (virtual
+/// devices, say), then USB and Bluetooth, where external pads and game pads
+/// live.
+fn bus_rank(bus: BusType) -> u8 {
+    match bus {
+        BusType::BUS_I8042
+        | BusType::BUS_I2C
+        | BusType::BUS_HOST
+        | BusType::BUS_SPI
+        | BusType::BUS_RMI => 0,
+        BusType::BUS_USB | BusType::BUS_BLUETOOTH => 2,
+        _ => 1,
+    }
+}
+
+/// What the picker knows about one touchpad candidate.
+#[derive(Clone, Copy, Debug)]
+struct Candidate<'a> {
+    name: &'a str,
+    bus: BusType,
+}
+
+/// Index of the candidate to use. Candidates come in event-number order and
+/// are ranked by, in turn: not a game pad (one is picked only when nothing
+/// else exists), bus ([`bus_rank`]), a touchpad driver name, lowest event
+/// number. `None` when there are no candidates.
+fn pick_index(candidates: &[Candidate]) -> Option<usize> {
+    candidates
         .iter()
-        .position(|name| name_preferred(name))
-        .or_else(|| (!names.is_empty()).then_some(0))
+        .enumerate()
+        .min_by_key(|&(i, c)| {
+            (
+                is_game_pad(c.name),
+                bus_rank(c.bus),
+                !name_preferred(c.name),
+                i,
+            )
+        })
+        .map(|(i, _)| i)
 }
 
 /// Axes the position is read from: ABS_X/ABS_Y when present, otherwise the
@@ -158,7 +252,26 @@ fn no_touchpad_msg(refused: usize) -> &'static str {
     }
 }
 
-/// `/dev/input/event*` nodes, sorted. Empty when the directory cannot be read.
+/// The `N` of an `eventN` node, `None` for any other name.
+fn event_number(path: &Path) -> Option<u32> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("event")?
+        .parse()
+        .ok()
+}
+
+/// Sorts event nodes by number, so `event6` comes before `event21` (a plain
+/// path sort puts it after). Names without a number go last, by name.
+fn sort_event_nodes(nodes: &mut [PathBuf]) {
+    nodes.sort_by(|a, b| {
+        let key = |p: &Path| event_number(p).map_or((1, 0), |n| (0, n));
+        key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+    });
+}
+
+/// `/dev/input/event*` nodes in event-number order. Empty when the directory
+/// cannot be read.
 fn event_nodes() -> Vec<PathBuf> {
     let Ok(dir) = fs::read_dir("/dev/input") else {
         return Vec::new();
@@ -172,7 +285,7 @@ fn event_nodes() -> Vec<PathBuf> {
                 .is_some_and(|name| name.starts_with("event"))
         })
         .collect();
-    nodes.sort();
+    sort_event_nodes(&mut nodes);
     nodes
 }
 
@@ -192,14 +305,15 @@ fn read_failed(e: io::Error) -> String {
 /// Opens the built-in touchpad and starts its reader thread. `Err` is a
 /// user-facing Portuguese message.
 pub fn open() -> Result<LinuxTouchpad, String> {
-    let mut candidates: Vec<(Device, String)> = Vec::new();
+    let mut candidates: Vec<(Device, String, BusType)> = Vec::new();
     let mut refused = 0_usize;
     for path in event_nodes() {
         match Device::open(&path) {
             Ok(dev) => {
                 if is_touchpad(caps_of(&dev)) {
                     let name = dev.name().unwrap_or_default().to_owned();
-                    candidates.push((dev, name));
+                    let bus = dev.input_id().bus_type();
+                    candidates.push((dev, name, bus));
                 }
             }
             Err(e) if e.kind() == ErrorKind::PermissionDenied => refused += 1,
@@ -210,10 +324,13 @@ pub fn open() -> Result<LinuxTouchpad, String> {
         return Err(no_touchpad_msg(refused).into());
     }
     let index = {
-        let names: Vec<&str> = candidates.iter().map(|(_, name)| name.as_str()).collect();
-        pick_index(&names).unwrap_or(0)
+        let ranked: Vec<Candidate> = candidates
+            .iter()
+            .map(|(_, name, bus)| Candidate { name, bus: *bus })
+            .collect();
+        pick_index(&ranked).unwrap_or(0)
     };
-    let (dev, name) = candidates.swap_remove(index);
+    let (dev, name, _) = candidates.swap_remove(index);
     drop(candidates);
     start(dev, name)
 }
@@ -262,9 +379,16 @@ fn start(dev: Device, name: String) -> Result<LinuxTouchpad, String> {
     };
     let shared = Arc::new(Shared::new(Touch { x, y, touching }));
     let worker = Arc::clone(&shared);
+    let seen = dev.cached_state().timestamp();
+    let source = Evdev {
+        dev,
+        track,
+        slot,
+        seen,
+    };
     let thread = thread::Builder::new()
         .name("xypad-evdev".into())
-        .spawn(move || run(dev, worker, track, slot))
+        .spawn(move || run(source, worker))
         .map_err(|e| format!("Não foi possível iniciar a leitura do touchpad: {e}"))?;
     Ok(LinuxTouchpad {
         name,
@@ -292,17 +416,63 @@ trait Grab {
     fn is_grabbed(&self) -> bool;
 }
 
-impl Grab for Device {
+/// The device as the reader loop sees it, behind a trait so the loop's grab,
+/// heartbeat and exit rules can be tested without a device.
+trait Source: Grab {
+    /// Reads what is pending (see [`drain`]) into `shared`.
+    fn read_into(&mut self, shared: &Shared) -> Poll;
+}
+
+/// The opened touchpad and the reader's per-device state.
+struct Evdev {
+    dev: Device,
+    track: Track,
+    /// Multitouch slot the kernel is writing to.
+    slot: i32,
+    /// evdev cache stamp at the last resync (see [`resynced`]).
+    seen: SystemTime,
+}
+
+impl Grab for Evdev {
     fn grab(&mut self) -> io::Result<()> {
-        Device::grab(self)
+        self.dev.grab()
     }
 
     fn ungrab(&mut self) -> io::Result<()> {
-        Device::ungrab(self)
+        self.dev.ungrab()
     }
 
     fn is_grabbed(&self) -> bool {
-        Device::is_grabbed(self)
+        self.dev.is_grabbed()
+    }
+}
+
+impl Source for Evdev {
+    fn read_into(&mut self, shared: &Shared) -> Poll {
+        let Evdev {
+            dev,
+            track,
+            slot,
+            seen,
+        } = self;
+        drain(|| {
+            let read = match dev.fetch_events() {
+                Ok(events) => {
+                    for ev in events {
+                        fold(shared, track, slot, ev);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            };
+            // Checked after every read, WouldBlock included: a resync lost to
+            // WouldBlock still left the cache correct, and a lost BTN_TOUCH
+            // release would otherwise stick.
+            if resynced(seen, dev.cached_state().timestamp()) {
+                sync_from_cache(dev, shared, track);
+            }
+            read
+        })
     }
 }
 
@@ -352,46 +522,45 @@ fn resynced(seen: &mut SystemTime, stamp: SystemTime) -> bool {
     }
 }
 
-/// Reader loop. Owns the device; keeps the grab matching the request on its
-/// own fd; folds events into `shared`. Ends on `stop` or when the device stops
-/// reading (for example it was unplugged), always ungrabbing first.
-fn run(mut dev: Device, shared: Arc<Shared>, track: Track, start_slot: i32) {
-    let mut slot = start_slot;
-    let mut seen = dev.cached_state().timestamp();
-    loop {
-        if shared.stop.load(Ordering::Acquire) {
-            break;
-        }
-        reconcile_grab(&mut dev, shared.grab_requested.load(Ordering::Acquire));
-        shared.grabbed.store(dev.is_grabbed(), Ordering::Relaxed);
+/// One reader poll at `now_ms` on the heartbeat clock: make the grab match
+/// the request and the app's heartbeat ([`grab_wanted`]), publish the grab
+/// state, then read.
+fn poll_once<S: Source>(src: &mut S, shared: &Shared, now_ms: u64) -> Poll {
+    let want = grab_wanted(
+        shared.grab_requested.load(Ordering::Acquire),
+        shared.since_last_poll(now_ms),
+    );
+    reconcile_grab(src, want);
+    shared.grabbed.store(src.is_grabbed(), Ordering::Relaxed);
+    src.read_into(shared)
+}
 
-        let poll = drain(|| {
-            let read = match dev.fetch_events() {
-                Ok(events) => {
-                    for ev in events {
-                        fold(&shared, &track, &mut slot, ev);
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            };
-            // Checked after every read, WouldBlock included: a resync lost to
-            // WouldBlock still left the cache correct, and a lost BTN_TOUCH
-            // release would otherwise stick.
-            if resynced(&mut seen, dev.cached_state().timestamp()) {
-                sync_from_cache(&dev, &shared, &track);
-            }
-            read
-        });
-        if poll == Poll::Gone {
+/// Publishes "reader gone" when the reader thread ends, however it ends
+/// (panic included): no grab, no touch, not alive.
+struct ReaderExit<'a>(&'a Shared);
+
+impl Drop for ReaderExit<'_> {
+    fn drop(&mut self) {
+        self.0.grabbed.store(false, Ordering::Relaxed);
+        self.0.touching.store(false, Ordering::Relaxed);
+        self.0.alive.store(false, Ordering::Release);
+    }
+}
+
+/// Reader loop. Owns the device; keeps the grab matching the request and
+/// the heartbeat on its own fd; folds events into `shared`. Ends on `stop`
+/// or when the device stops reading (for example it was unplugged), always
+/// ungrabbing first.
+fn run<S: Source>(mut src: S, shared: Arc<Shared>) {
+    let _exit = ReaderExit(&shared);
+    while !shared.stop.load(Ordering::Acquire) {
+        if poll_once(&mut src, &shared, shared.now_ms()) == Poll::Gone {
             break;
         }
         thread::sleep(POLL_INTERVAL);
     }
-    let _ = dev.ungrab();
     // Closing the fd releases any grab too, so the state is clear either way.
-    shared.grabbed.store(false, Ordering::Relaxed);
-    shared.touching.store(false, Ordering::Relaxed);
+    let _ = src.ungrab();
 }
 
 /// Takes the touch state from evdev's cache. Only valid after a resync (see
@@ -489,11 +658,24 @@ impl Touchpad for LinuxTouchpad {
         &self.name
     }
 
+    /// Also the heartbeat: the reader holds the grab only while this keeps
+    /// being called (see the module docs).
     fn latest(&self) -> Touch {
+        self.shared.stamp_poll();
         self.shared.touch()
     }
 
+    /// Grabbing fails only once the reader thread has ended; releasing
+    /// never fails.
     fn set_grab(&mut self, grab: bool) -> Result<(), String> {
+        if grab {
+            if !self.is_alive() {
+                return Err(GONE_MSG.into());
+            }
+            // A grab request counts as a poll, so the reader grabs at once.
+            // Stamped before the Release store below publishes the request.
+            self.shared.stamp_poll();
+        }
         self.shared.grab_requested.store(grab, Ordering::Release);
         Ok(())
     }
@@ -501,12 +683,23 @@ impl Touchpad for LinuxTouchpad {
     fn grabbed(&self) -> bool {
         self.shared.grabbed.load(Ordering::Relaxed)
     }
+
+    /// EVIOCGRAB takes every event of the device, so taps, clicks and
+    /// scrolling stop reaching any window too.
+    fn grab_stops_clicks(&self) -> bool {
+        true
+    }
+
+    fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use evdev::EventType;
+    use std::sync::atomic::AtomicUsize;
 
     const TOUCHPAD: Caps = Caps {
         abs_xy: true,
@@ -620,26 +813,125 @@ mod tests {
         assert!(!is_touchpad(c));
     }
 
+    fn on(bus: BusType, name: &str) -> Candidate<'_> {
+        Candidate { name, bus }
+    }
+
+    /// Candidates all on one bus, so only the names decide.
+    fn same_bus<'a>(names: &[&'a str]) -> Vec<Candidate<'a>> {
+        names.iter().map(|&n| on(BusType::BUS_I8042, n)).collect()
+    }
+
     #[test]
     fn preferred_name_wins_over_first_candidate() {
         let names = ["Logitech USB Receiver", "SynPS/2 Synaptics TouchPad"];
-        assert_eq!(pick_index(&names), Some(1));
+        assert_eq!(pick_index(&same_bus(&names)), Some(1));
     }
 
     #[test]
     fn first_candidate_wins_without_a_hint() {
-        assert_eq!(pick_index(&["Alpha", "Beta"]), Some(0));
+        assert_eq!(pick_index(&same_bus(&["Alpha", "Beta"])), Some(0));
     }
 
     #[test]
     fn first_hinted_candidate_wins_among_hinted() {
         let names = ["Foo Pad", "ELAN Touchpad", "Synaptics"];
-        assert_eq!(pick_index(&names), Some(1));
+        assert_eq!(pick_index(&same_bus(&names)), Some(1));
     }
 
     #[test]
     fn no_candidates_means_no_pick() {
         assert_eq!(pick_index(&[]), None);
+    }
+
+    #[test]
+    fn built_in_touchpad_beats_a_game_pad_touchpad() {
+        // X4 regression: both names say "touchpad"; the DualShock 4 used to
+        // win whenever its node came first.
+        let ds4 = "Sony Interactive Entertainment Wireless Controller Touchpad";
+        let cands = [
+            on(BusType::BUS_USB, ds4),
+            on(BusType::BUS_I8042, "SynPS/2 Synaptics TouchPad"),
+        ];
+        assert_eq!(pick_index(&cands), Some(1));
+        let dualsense = "Sony Interactive Entertainment DualSense Wireless Controller Touchpad";
+        let cands = [
+            on(BusType::BUS_BLUETOOTH, dualsense),
+            on(BusType::BUS_I2C, "ELAN0670:00 04F3:3150 Touchpad"),
+        ];
+        assert_eq!(pick_index(&cands), Some(1));
+    }
+
+    #[test]
+    fn game_pad_is_last_resort_even_on_an_internal_bus() {
+        let pad = "Wireless Controller Touchpad";
+        let cands = [
+            on(BusType::BUS_I2C, pad),
+            on(BusType::BUS_VIRTUAL, "Virtual Pointer"),
+        ];
+        assert_eq!(pick_index(&cands), Some(1));
+        // Only a game pad: use it rather than nothing.
+        assert_eq!(pick_index(&[on(BusType::BUS_USB, pad)]), Some(0));
+        assert!(is_game_pad("Sony Interactive Entertainment Wireless Controller Touchpad"));
+        assert!(!is_game_pad("SynPS/2 Synaptics TouchPad"));
+    }
+
+    #[test]
+    fn internal_bus_beats_usb_and_bluetooth_even_without_a_name_hint() {
+        let cands = [
+            on(BusType::BUS_USB, "Apple Inc. Magic Trackpad"),
+            on(BusType::BUS_BLUETOOTH, "Magic Trackpad 2"),
+            on(BusType::BUS_I2C, "PNP0C50:00 0911:5288"),
+        ];
+        assert_eq!(pick_index(&cands), Some(2));
+    }
+
+    #[test]
+    fn bus_ranks_internal_then_other_then_external() {
+        for bus in [
+            BusType::BUS_I8042,
+            BusType::BUS_I2C,
+            BusType::BUS_HOST,
+            BusType::BUS_SPI,
+            BusType::BUS_RMI,
+        ] {
+            assert_eq!(bus_rank(bus), 0, "{bus:?}");
+        }
+        assert_eq!(bus_rank(BusType::BUS_VIRTUAL), 1);
+        assert_eq!(bus_rank(BusType(0xFFFF)), 1);
+        assert_eq!(bus_rank(BusType::BUS_USB), 2);
+        assert_eq!(bus_rank(BusType::BUS_BLUETOOTH), 2);
+        // Among external pads, the name hint and then node order decide.
+        let cands = [
+            on(BusType::BUS_USB, "Some Tablet"),
+            on(BusType::BUS_BLUETOOTH, "Magic Trackpad 2"),
+            on(BusType::BUS_USB, "Apple Inc. Magic Trackpad"),
+        ];
+        assert_eq!(pick_index(&cands), Some(1));
+    }
+
+    #[test]
+    fn event_nodes_sort_by_number() {
+        // X4 regression: a path sort put event21 before event6.
+        let mut nodes: Vec<PathBuf> = ["event21", "event6", "eventx", "event10", "event2"]
+            .iter()
+            .map(|n| Path::new("/dev/input").join(n))
+            .collect();
+        sort_event_nodes(&mut nodes);
+        let names: Vec<&str> = nodes
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert_eq!(names, ["event2", "event6", "event10", "event21", "eventx"]);
+    }
+
+    #[test]
+    fn event_number_reads_only_event_nodes() {
+        assert_eq!(event_number(Path::new("/dev/input/event0")), Some(0));
+        assert_eq!(event_number(Path::new("/dev/input/event21")), Some(21));
+        assert_eq!(event_number(Path::new("/dev/input/event")), None);
+        assert_eq!(event_number(Path::new("/dev/input/mouse0")), None);
+        assert_eq!(event_number(Path::new("/dev/input/event1x")), None);
     }
 
     #[test]
@@ -1040,5 +1332,214 @@ mod tests {
     fn open_does_not_panic_without_input_devices() {
         // Accepts Ok (a real touchpad on this machine) or Err (a container).
         let _ = open();
+    }
+
+    /// The fake device's grab, observable after the reader has taken the
+    /// source away.
+    #[derive(Default)]
+    struct FakeDevice {
+        grabbed: AtomicBool,
+        grabs: AtomicUsize,
+    }
+
+    /// Scripted device for the reader loop: `Idle` for `idle_polls` reads,
+    /// then `Gone` (or a panic when `panics`). Each read leaves a finger
+    /// down, as if the device vanished mid-touch.
+    struct FakeSource {
+        dev: Arc<FakeDevice>,
+        idle_polls: usize,
+        panics: bool,
+    }
+
+    impl FakeSource {
+        fn new(idle_polls: usize) -> Self {
+            Self {
+                dev: Arc::default(),
+                idle_polls,
+                panics: false,
+            }
+        }
+    }
+
+    impl Grab for FakeSource {
+        fn grab(&mut self) -> io::Result<()> {
+            self.dev.grabs.fetch_add(1, Ordering::Relaxed);
+            self.dev.grabbed.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn ungrab(&mut self) -> io::Result<()> {
+            self.dev.grabbed.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_grabbed(&self) -> bool {
+            self.dev.grabbed.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Source for FakeSource {
+        fn read_into(&mut self, shared: &Shared) -> Poll {
+            shared.touching.store(true, Ordering::Relaxed);
+            if self.idle_polls == 0 {
+                assert!(!self.panics, "scripted reader panic");
+                return Poll::Gone;
+            }
+            self.idle_polls -= 1;
+            Poll::Idle
+        }
+    }
+
+    /// A pad on `shared` whose reader thread runs `src` instead of a device.
+    fn pad_reading_from(src: FakeSource, shared: Arc<Shared>) -> LinuxTouchpad {
+        let worker = Arc::clone(&shared);
+        let thread = thread::spawn(move || run(src, worker));
+        LinuxTouchpad {
+            name: "fake".into(),
+            shared,
+            thread: Some(thread),
+        }
+    }
+
+    fn pad_reading(src: FakeSource) -> LinuxTouchpad {
+        pad_reading_from(src, Arc::new(fresh()))
+    }
+
+    /// Fresh shared state with the grab already requested and just polled.
+    fn grab_requested() -> Arc<Shared> {
+        let shared = fresh();
+        shared.grab_requested.store(true, Ordering::Release);
+        shared.stamp_poll();
+        Arc::new(shared)
+    }
+
+    #[test]
+    fn grab_stops_clicks_on_linux() {
+        assert!(pad_reading(FakeSource::new(usize::MAX)).grab_stops_clicks());
+    }
+
+    #[test]
+    fn device_gone_ends_the_reader_and_marks_the_pad_dead() {
+        // X3 regression: the reader ended on ENODEV but the pad still looked
+        // usable, so the app kept a dead touchpad for the whole session.
+        let src = FakeSource::new(3);
+        let dev = Arc::clone(&src.dev);
+        let mut pad = pad_reading_from(src, grab_requested());
+        let thread = pad.thread.take().expect("reader thread");
+        thread.join().expect("reader ends cleanly");
+        assert!(dev.grabs.load(Ordering::Relaxed) >= 1, "the grab was taken");
+        assert!(!dev.grabbed.load(Ordering::Relaxed), "and released on the way out");
+        assert!(!pad.is_alive());
+        assert!(!pad.grabbed());
+        assert!(!pad.latest().touching, "a vanished finger must not stick");
+        assert_eq!(pad.set_grab(true), Err(GONE_MSG.to_owned()));
+        assert_eq!(pad.set_grab(false), Ok(()), "release always succeeds");
+    }
+
+    #[test]
+    fn reader_is_alive_until_dropped() {
+        let pad = pad_reading(FakeSource::new(usize::MAX));
+        let shared = Arc::clone(&pad.shared);
+        thread::sleep(POLL_INTERVAL * 3);
+        assert!(pad.is_alive());
+        drop(pad);
+        assert!(!shared.alive.load(Ordering::Acquire));
+        assert!(!shared.touching.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_panicking_reader_still_marks_the_pad_dead() {
+        let mut src = FakeSource::new(0);
+        src.panics = true;
+        let mut pad = pad_reading(src);
+        let thread = pad.thread.take().expect("reader thread");
+        assert!(thread.join().is_err(), "the scripted panic happened");
+        assert!(!pad.is_alive());
+        assert!(!pad.latest().touching);
+    }
+
+    #[test]
+    fn stop_ends_the_reader_and_releases_the_grab() {
+        let src = FakeSource::new(usize::MAX);
+        let dev = Arc::clone(&src.dev);
+        let shared = grab_requested();
+        let worker = Arc::clone(&shared);
+        let thread = thread::spawn(move || run(src, worker));
+        // Wait for the reader to grab, then stop it the way Drop does.
+        for _ in 0..500 {
+            if shared.grabbed.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        assert!(dev.grabbed.load(Ordering::Relaxed));
+        shared.stop.store(true, Ordering::Release);
+        thread.join().expect("reader ends cleanly");
+        assert!(!dev.grabbed.load(Ordering::Relaxed));
+        assert!(!shared.grabbed.load(Ordering::Relaxed));
+        assert!(!shared.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn heartbeat_holds_the_grab_only_while_polls_arrive() {
+        let ms = Duration::from_millis;
+        assert_eq!(POLL_TIMEOUT, ms(500));
+        assert!(grab_wanted(true, ms(0)));
+        assert!(grab_wanted(true, ms(499)));
+        assert!(!grab_wanted(true, ms(500)));
+        assert!(!grab_wanted(true, Duration::MAX));
+        assert!(!grab_wanted(false, ms(0)));
+    }
+
+    #[test]
+    fn reader_lets_go_when_the_ui_stops_polling_and_grabs_again_when_it_resumes() {
+        // X5 regression: a minimised window on Wayland gets no frames, so the
+        // touchpad stayed grabbed while the user worked elsewhere.
+        let shared = fresh();
+        let mut src = FakeSource::new(usize::MAX);
+        shared.grab_requested.store(true, Ordering::Release);
+        shared.last_poll_ms.store(10_000, Ordering::Relaxed);
+
+        poll_once(&mut src, &shared, 10_000);
+        assert!(src.is_grabbed());
+        assert!(shared.grabbed.load(Ordering::Relaxed));
+        poll_once(&mut src, &shared, 10_499);
+        assert!(src.is_grabbed());
+        // No poll for 500 ms: release, and say so.
+        poll_once(&mut src, &shared, 10_500);
+        assert!(!src.is_grabbed());
+        assert!(!shared.grabbed.load(Ordering::Relaxed));
+        poll_once(&mut src, &shared, 60_000);
+        assert!(!src.is_grabbed());
+        // Polls resume with the grab still requested: grab again.
+        shared.last_poll_ms.store(60_000, Ordering::Relaxed);
+        poll_once(&mut src, &shared, 60_004);
+        assert!(src.is_grabbed());
+        assert!(shared.grabbed.load(Ordering::Relaxed));
+        // A release request wins over fresh polls.
+        shared.grab_requested.store(false, Ordering::Release);
+        poll_once(&mut src, &shared, 60_008);
+        assert!(!src.is_grabbed());
+    }
+
+    #[test]
+    fn latest_and_grab_requests_stamp_the_heartbeat() {
+        let mut pad = pad_reading(FakeSource::new(usize::MAX));
+        pad.shared.last_poll_ms.store(u64::MAX, Ordering::Relaxed);
+        let _ = pad.latest();
+        let stamped = pad.shared.last_poll_ms.load(Ordering::Relaxed);
+        assert!(stamped <= pad.shared.now_ms(), "latest() stamps now");
+        pad.shared.last_poll_ms.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(pad.set_grab(true), Ok(()));
+        let stamped = pad.shared.last_poll_ms.load(Ordering::Relaxed);
+        assert!(stamped <= pad.shared.now_ms(), "set_grab(true) stamps now");
+    }
+
+    #[test]
+    fn a_racing_stamp_counts_as_just_polled() {
+        let shared = fresh();
+        shared.last_poll_ms.store(2_000, Ordering::Relaxed);
+        assert_eq!(shared.since_last_poll(1_000), Duration::ZERO);
+        assert_eq!(shared.since_last_poll(2_250), Duration::from_millis(250));
     }
 }

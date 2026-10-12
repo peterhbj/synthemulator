@@ -15,7 +15,20 @@
 //! and every 100 ms because Windows drops the clip on focus changes. The
 //! cursor stays put, but touchpad clicks (buttons, tap-to-click) still reach
 //! the window under the pinned cursor, and system multi-finger gestures
-//! still run; that is accepted.
+//! still run, so [`Touchpad::grab_stops_clicks`] is false and the app
+//! shields its own widgets.
+//!
+//! The clip is system-wide, so the thread holds it only while the
+//! foreground window belongs to this process and the app keeps polling
+//! [`Touchpad::latest`] (at most `hid_logic::POLL_TIMEOUT`, 500 ms, between
+//! polls). Otherwise it releases the clip and forgets the pin; once both
+//! hold again with the grab still requested, it pins wherever the cursor is
+//! then. A stalled or minimised UI, or another app in front, is never left
+//! with a frozen cursor. The rules are `hid_logic::clip_wanted` and
+//! `hid_logic::clip_step`.
+//!
+//! [`Touchpad::is_alive`] turns false once the input thread has ended, for
+//! whatever reason (window destroyed, message loop failure, teardown).
 //!
 //! Watchdog: the same 100 ms tick lifts a touch that has had no report for
 //! `hid_logic::STALE_TOUCH` (150 ms), so a lost lift (dropped report, input
@@ -56,19 +69,22 @@ use windows_sys::Win32::UI::Input::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetTimer, UnregisterClassW,
-    GIDC_REMOVAL, HWND_MESSAGE, MSG, WM_APP, WM_CLOSE, WM_DESTROY, WM_INPUT,
-    WM_INPUT_DEVICE_CHANGE, WM_TIMER, WNDCLASSW,
+    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetTimer, UnregisterClassW, GIDC_REMOVAL, HWND_MESSAGE, MSG, WM_APP, WM_CLOSE,
+    WM_DESTROY, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_TIMER, WNDCLASSW,
 };
 
 use super::hid_logic::{
-    is_precision_touchpad, layout, pad_change, tip_on, touch_is_stale, usage_span, Contact,
-    FrameTracker, Layout, PadChange, Update, ValueCap, PAGE_DIGITIZER, PAGE_GENERIC_DESKTOP,
-    USAGE_CONTACT_COUNT, USAGE_TOUCH_PAD, USAGE_X, USAGE_Y,
+    clip_step, clip_wanted, is_precision_touchpad, layout, pad_change, same_process, tip_on,
+    touch_is_stale, usage_span, ClipStep, Contact, FrameTracker, Heartbeat, Layout, PadChange,
+    Update, ValueCap, PAGE_DIGITIZER, PAGE_GENERIC_DESKTOP, USAGE_CONTACT_COUNT, USAGE_TOUCH_PAD,
+    USAGE_X, USAGE_Y,
 };
 use super::{Touch, Touchpad};
 
 const NO_TOUCHPAD: &str = "Nenhum touchpad de precisão encontrado.";
+/// `set_grab(true)` after the input thread has ended.
+const GONE: &str = "A leitura do touchpad parou. Ative o XY de novo.";
 /// How long [`open`] waits for the input thread to come up.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 const TICK_TIMER_ID: usize = 1;
@@ -112,6 +128,11 @@ struct Shared {
     stop: AtomicBool,
     /// The message window as an integer, 0 while there is none.
     hwnd: AtomicIsize,
+    /// The input thread is running. Cleared on every way out of it
+    /// ([`ThreadExit`]).
+    alive: AtomicBool,
+    /// When the app last polled [`Touchpad::latest`] or asked for the grab.
+    heartbeat: Heartbeat,
 }
 
 impl Shared {
@@ -123,6 +144,8 @@ impl Shared {
             grab: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             hwnd: AtomicIsize::new(0),
+            alive: AtomicBool::new(true),
+            heartbeat: Heartbeat::new(),
         }
     }
 
@@ -195,7 +218,10 @@ impl Touchpad for WindowsTouchpad {
         &self.name
     }
 
+    /// Also the heartbeat: the input thread holds the cursor clip only while
+    /// this keeps being called (see the module docs).
     fn latest(&self) -> Touch {
+        self.shared.heartbeat.beat();
         let touching = self.shared.touching.load(Ordering::Acquire);
         Touch {
             x: f32::from_bits(self.shared.x.load(Ordering::Relaxed)),
@@ -204,8 +230,17 @@ impl Touchpad for WindowsTouchpad {
         }
     }
 
-    /// Pins the cursor (see the module docs); never fails.
+    /// Pins the cursor (see the module docs). Grabbing fails only once the
+    /// input thread has ended; releasing never fails.
     fn set_grab(&mut self, grab: bool) -> Result<(), String> {
+        if grab {
+            if !self.is_alive() {
+                return Err(GONE.into());
+            }
+            // A grab request counts as a poll, so the thread pins at once
+            // instead of waiting for the app's next `latest()`.
+            self.shared.heartbeat.beat();
+        }
         let was = self.shared.grab.swap(grab, Ordering::SeqCst);
         if was && !grab {
             // Release right away from this thread; the input thread then
@@ -220,6 +255,17 @@ impl Touchpad for WindowsTouchpad {
 
     fn grabbed(&self) -> bool {
         self.shared.grab.load(Ordering::SeqCst)
+    }
+
+    /// False on purpose: a 1x1 `ClipCursor` stops the cursor moving, but
+    /// touchpad buttons, tap-to-click and scrolling still reach the window
+    /// under the pinned cursor, so the app must shield its own widgets.
+    fn grab_stops_clicks(&self) -> bool {
+        false
+    }
+
+    fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::SeqCst)
     }
 }
 
@@ -246,6 +292,48 @@ fn release_cursor() {
     }
 }
 
+/// Confine the cursor to the single pixel at `p`.
+fn clip_to(p: POINT) {
+    let rect = RECT {
+        left: p.x,
+        top: p.y,
+        right: p.x.saturating_add(1),
+        bottom: p.y.saturating_add(1),
+    };
+    // SAFETY: rect is a valid RECT for the duration of the call.
+    unsafe {
+        ClipCursor(&rect);
+    }
+}
+
+/// Whether the foreground window belongs to this process. False when no
+/// window is in the foreground (e.g. while the desktop switches).
+fn foreground_is_ours() -> bool {
+    // SAFETY: no arguments; returns null when there is no foreground window.
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    // SAFETY: pid is a valid out pointer. A handle that died in the
+    // meantime makes the call fail and leaves pid at 0.
+    unsafe {
+        GetWindowThreadProcessId(fg, &mut pid);
+    }
+    // std::process::id() is GetCurrentProcessId() on Windows; this crate's
+    // windows-sys features do not include Win32_System_Threading.
+    same_process(pid, std::process::id())
+}
+
+/// Clears [`Shared::alive`] when the input thread ends, however it ends.
+struct ThreadExit<'a>(&'a Shared);
+
+impl Drop for ThreadExit<'_> {
+    fn drop(&mut self) {
+        self.0.alive.store(false, Ordering::SeqCst);
+    }
+}
+
 /// NUL-terminated UTF-16.
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -254,6 +342,8 @@ fn wide(s: &str) -> Vec<u16> {
 /// Input thread: find the touchpad, create the window, register for raw
 /// input, report to [`open`], pump messages until WM_CLOSE.
 fn run(shared: Arc<Shared>, generation: u64, tx: mpsc::Sender<Result<String, String>>) {
+    // First local, so it is dropped last, after every other way out.
+    let _exit = ThreadExit(&shared);
     let name = match find_touchpad() {
         Ok(Some(name)) => name,
         Ok(None) => {
@@ -665,33 +755,36 @@ impl ThreadState {
         }
     }
 
-    /// Bring the cursor clip in line with the grab flag.
+    /// Bring the cursor clip in line with the grab flag, the app's
+    /// heartbeat and the foreground window (see the module docs).
     fn apply_grab(&mut self) {
-        let want =
-            self.shared.grab.load(Ordering::SeqCst) && !self.shared.stop.load(Ordering::SeqCst);
-        if want {
-            if self.pin.is_none() {
+        let shared = &self.shared;
+        let requested = shared.grab.load(Ordering::SeqCst);
+        let stopping = shared.stop.load(Ordering::SeqCst);
+        let since_poll = shared.heartbeat.since(shared.heartbeat.now_ms());
+        // Only ask Windows about the foreground when it can matter.
+        let foreground = requested && !stopping && foreground_is_ours();
+        let want = clip_wanted(requested, stopping, since_poll, foreground);
+        match clip_step(want, self.pin.is_some()) {
+            ClipStep::Pin => {
                 let mut p = POINT { x: 0, y: 0 };
                 // SAFETY: p is a valid out pointer.
                 if unsafe { GetCursorPos(&mut p) } == 0 {
                     return; // e.g. secure desktop; retried on the next tick
                 }
                 self.pin = Some(p);
+                clip_to(p);
             }
-            if let Some(p) = self.pin {
-                let rect = RECT {
-                    left: p.x,
-                    top: p.y,
-                    right: p.x.saturating_add(1),
-                    bottom: p.y.saturating_add(1),
-                };
-                // SAFETY: rect is a valid RECT for the duration of the call.
-                unsafe {
-                    ClipCursor(&rect);
+            ClipStep::Reapply => {
+                if let Some(p) = self.pin {
+                    clip_to(p);
                 }
             }
-        } else if self.pin.take().is_some() {
-            release_cursor();
+            ClipStep::Release => {
+                self.pin = None;
+                release_cursor();
+            }
+            ClipStep::Idle => {}
         }
     }
 
@@ -1089,6 +1182,36 @@ mod tests {
     }
 
     #[test]
+    fn grab_does_not_stop_clicks_on_windows() {
+        assert!(!pad_without_thread().grab_stops_clicks());
+    }
+
+    #[test]
+    fn ended_thread_marks_the_pad_dead_and_refuses_a_grab() {
+        let mut pad = pad_without_thread();
+        assert!(pad.is_alive());
+        drop(ThreadExit(&pad.shared));
+        assert!(!pad.is_alive());
+        assert!(pad.set_grab(true).is_err());
+        assert!(!pad.grabbed());
+        assert_eq!(pad.set_grab(false), Ok(()), "release always succeeds");
+    }
+
+    #[test]
+    fn latest_and_grab_requests_stamp_the_heartbeat() {
+        let mut pad = pad_without_thread();
+        pad.shared.heartbeat.beat_at(u64::MAX);
+        let _ = pad.latest();
+        let hb = &pad.shared.heartbeat;
+        assert!(hb.last_ms() <= hb.now_ms(), "latest() stamps now");
+        pad.shared.heartbeat.beat_at(u64::MAX);
+        assert_eq!(pad.set_grab(true), Ok(()));
+        let hb = &pad.shared.heartbeat;
+        assert!(hb.last_ms() <= hb.now_ms(), "set_grab(true) stamps now");
+        assert_eq!(pad.set_grab(false), Ok(()));
+    }
+
+    #[test]
     fn grab_flag_round_trips_without_a_thread() {
         let mut pad = pad_without_thread();
         assert!(!pad.grabbed());
@@ -1107,6 +1230,7 @@ mod tests {
         match open() {
             Ok(mut pad) => {
                 assert!(!pad.name().is_empty());
+                assert!(pad.is_alive());
                 assert!(!pad.grabbed());
                 assert_eq!(pad.set_grab(true), Ok(()));
                 assert_eq!(pad.set_grab(false), Ok(()));

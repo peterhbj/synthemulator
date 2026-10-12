@@ -1,13 +1,16 @@
 //! HID decisions for the Windows Precision Touchpad backend that need no
 //! Win32: which link collections hold fingers, which range to normalise
 //! against, how to read a raw value, when a report means "touching", where
-//! that puts the pad, and when a touch has gone stale.
+//! that puts the pad, and when a touch has gone stale. Also the grab rules:
+//! when the cursor clip may be held (app polling, Helix in front) and what
+//! to do with it.
 //!
 //! Everything here works on plain numbers copied out of the HidP structures,
 //! so it builds and is unit-tested on every platform; the Win32 calls live in
 //! `windows.rs`.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// HID usage page: Generic Desktop.
 pub(crate) const PAGE_GENERIC_DESKTOP: u16 = 0x01;
@@ -315,6 +318,103 @@ pub(crate) const STALE_TOUCH: Duration = Duration::from_millis(150);
 /// input taken by another process, session locked), so the pad must lift.
 pub(crate) fn touch_is_stale(touching: bool, since_last_report: Option<Duration>) -> bool {
     touching && since_last_report.is_none_or(|d| d >= STALE_TOUCH)
+}
+
+/// The app polls [`crate::Touchpad::latest`] every frame while the pad is in
+/// use. No poll for this long means the UI stopped drawing (minimised
+/// window, stalled UI thread), so the input thread lets go of the cursor
+/// until polls resume.
+pub(crate) const POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// When the app last polled, shared between threads as milliseconds on a
+/// private monotonic clock. Stamping and reading are single atomic ops.
+#[derive(Debug)]
+pub(crate) struct Heartbeat {
+    origin: Instant,
+    /// Milliseconds since `origin` of the last poll.
+    last_ms: AtomicU64,
+}
+
+impl Heartbeat {
+    /// The clock starts now, with a poll stamped now.
+    pub(crate) fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Milliseconds since the clock started.
+    pub(crate) fn now_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Record a poll now.
+    pub(crate) fn beat(&self) {
+        self.beat_at(self.now_ms());
+    }
+
+    /// Record a poll at `ms` on this clock.
+    pub(crate) fn beat_at(&self, ms: u64) {
+        self.last_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// When the last poll was, in milliseconds on this clock.
+    pub(crate) fn last_ms(&self) -> u64 {
+        self.last_ms.load(Ordering::Relaxed)
+    }
+
+    /// Time from the last poll to `now_ms`. A poll stamped after `now_ms`
+    /// was read (another thread raced ahead) counts as just now.
+    pub(crate) fn since(&self, now_ms: u64) -> Duration {
+        Duration::from_millis(now_ms.saturating_sub(self.last_ms()))
+    }
+}
+
+/// Whether the cursor clip may be held now: the app asked for the grab, the
+/// touchpad is not closing, the app polled within [`POLL_TIMEOUT`], and the
+/// foreground window belongs to this process. The clip is system-wide, so it
+/// must never freeze the cursor while another app is in front or while the
+/// UI cannot release it.
+pub(crate) fn clip_wanted(
+    requested: bool,
+    stopping: bool,
+    since_last_poll: Duration,
+    foreground_ours: bool,
+) -> bool {
+    requested && !stopping && since_last_poll < POLL_TIMEOUT && foreground_ours
+}
+
+/// True when the foreground window's process id (`window_pid`, 0 when it
+/// could not be read) is this process.
+pub(crate) fn same_process(window_pid: u32, own_pid: u32) -> bool {
+    window_pid != 0 && window_pid == own_pid
+}
+
+/// What the input thread does with the cursor clip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClipStep {
+    /// Pin at the cursor's current position and clip to it.
+    Pin,
+    /// Clip to the existing pin again (Windows drops the clip on focus
+    /// changes).
+    Reapply,
+    /// Release the clip and forget the pin, so the next grab pins wherever
+    /// the cursor is then.
+    Release,
+    /// Not wanted and not held: nothing to do.
+    Idle,
+}
+
+/// The clip step for whether the clip is wanted ([`clip_wanted`]) and
+/// whether a pin is held.
+pub(crate) fn clip_step(want: bool, pinned: bool) -> ClipStep {
+    match (want, pinned) {
+        (true, false) => ClipStep::Pin,
+        (true, true) => ClipStep::Reapply,
+        (false, true) => ClipStep::Release,
+        (false, false) => ClipStep::Idle,
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +904,82 @@ mod tests {
         // After the watchdog resets the tracker, a zero is a real lift.
         t = FrameTracker::default();
         assert_eq!(feed(&mut t, Some(0), 1, &[touch(9, 9)]).0, Update::Lift);
+    }
+
+    #[test]
+    fn clip_is_held_only_while_requested_polled_and_in_front() {
+        let ms = Duration::from_millis;
+        assert_eq!(POLL_TIMEOUT, ms(500));
+        assert!(clip_wanted(true, false, ms(0), true));
+        assert!(clip_wanted(true, false, ms(499), true));
+        // The UI stopped polling (minimised, stalled): let go.
+        assert!(!clip_wanted(true, false, ms(500), true));
+        assert!(!clip_wanted(true, false, Duration::MAX, true));
+        // X2 regression: another app in front must never get a frozen cursor.
+        assert!(!clip_wanted(true, false, ms(0), false));
+        // Not requested, or closing.
+        assert!(!clip_wanted(false, false, ms(0), true));
+        assert!(!clip_wanted(true, true, ms(0), true));
+    }
+
+    #[test]
+    fn clip_step_pins_reapplies_and_releases() {
+        assert_eq!(clip_step(true, false), ClipStep::Pin);
+        assert_eq!(clip_step(true, true), ClipStep::Reapply);
+        assert_eq!(clip_step(false, true), ClipStep::Release);
+        assert_eq!(clip_step(false, false), ClipStep::Idle);
+    }
+
+    #[test]
+    fn leaving_the_foreground_releases_and_coming_back_pins_again() {
+        // Walk the input thread's tick through Helix losing and regaining
+        // the foreground while the grab stays requested.
+        let mut pinned = false;
+        let mut steps = Vec::new();
+        for foreground in [true, true, false, false, true] {
+            let step = clip_step(clip_wanted(true, false, Duration::ZERO, foreground), pinned);
+            pinned = matches!(step, ClipStep::Pin | ClipStep::Reapply);
+            steps.push(step);
+        }
+        assert_eq!(
+            steps,
+            [
+                ClipStep::Pin,
+                ClipStep::Reapply,
+                ClipStep::Release,
+                ClipStep::Idle,
+                // Re-pinned at wherever the cursor is now.
+                ClipStep::Pin,
+            ]
+        );
+    }
+
+    #[test]
+    fn same_process_needs_a_real_matching_pid() {
+        assert!(same_process(4242, 4242));
+        assert!(!same_process(4243, 4242));
+        // GetWindowThreadProcessId failed (stale window): not ours.
+        assert!(!same_process(0, 4242));
+        assert!(!same_process(0, 0));
+    }
+
+    #[test]
+    fn heartbeat_measures_time_since_the_last_poll() {
+        let hb = Heartbeat::new();
+        hb.beat_at(1_000);
+        assert_eq!(hb.since(1_000), Duration::ZERO);
+        assert_eq!(hb.since(1_499), Duration::from_millis(499));
+        assert_eq!(hb.since(1_500), POLL_TIMEOUT);
+        // A poll stamped after `now` was read counts as just now.
+        assert_eq!(hb.since(900), Duration::ZERO);
+        hb.beat_at(u64::MAX);
+        hb.beat();
+        assert!(hb.last_ms() <= hb.now_ms(), "beat stamps now");
+    }
+
+    #[test]
+    fn heartbeat_starts_fresh() {
+        let hb = Heartbeat::new();
+        assert!(hb.since(hb.now_ms()) < POLL_TIMEOUT);
     }
 }
