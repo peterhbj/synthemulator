@@ -274,6 +274,25 @@ mod tests {
     }
 
     #[test]
+    fn json_from_this_build_parses_with_the_88ea342_memo_struct() {
+        // The `TrackMemo` of commit 88ea342, which had four hot-cue slots.
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Build88ea342Memo {
+            hot_cues: [Option<f64>; 4],
+            bpm: Option<f64>,
+        }
+        let mut memo = TrackMemo::default();
+        memo.hot_cues[0] = Some(1.0);
+        memo.hot_cues[5] = Some(7.5);
+        memo.bpm = Some(126.0);
+        let json = serde_json::to_string(&memo).unwrap();
+        let old: Build88ea342Memo = serde_json::from_str(&json).expect("old build reads the file");
+        assert_eq!(old.hot_cues[0], Some(1.0));
+        assert_eq!(old.bpm, Some(126.0));
+    }
+
+    #[test]
     fn corrupt_file_is_kept_aside() {
         let path = temp_file("bad");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
