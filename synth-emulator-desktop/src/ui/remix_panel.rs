@@ -161,6 +161,8 @@ pub struct RemixUi {
     /// [deck][0 = down (E/U), 1 = up (R/I)]
     filter_keys: [[bool; 2]; DECKS],
     xf_glide: Option<(f32, f32, f64)>,
+    /// An automatic transition was running on the previous frame.
+    auto_running: bool,
     message: Option<(String, f64)>,
     last_time: f64,
 }
@@ -186,6 +188,7 @@ impl RemixUi {
             mix: MixUi::default(),
             filter_keys: [[false; 2]; DECKS],
             xf_glide: None,
+            auto_running: false,
             message: None,
             last_time: 0.0,
         }
@@ -328,10 +331,12 @@ impl RemixUi {
             if t >= 1.0 {
                 self.xf_glide = None;
             }
-        } else if state.auto.is_some() {
-            // The engine is driving the crossfader; follow it.
+        } else if state.auto.is_some() || self.auto_running {
+            // The engine drives the crossfader during a transition. The frame it
+            // ends, take its final position too (exactly 0 or 1).
             self.mix.crossfader = state.crossfader;
         }
+        self.auto_running = state.auto.is_some();
 
         if let Some((_, t)) = &self.message {
             if now - t > 6.0 {
@@ -341,7 +346,8 @@ impl RemixUi {
         settings_changed
     }
 
-    /// Remix keyboard map. Returns true when the key was used.
+    /// Remix keyboard map. Returns true when the key changed `settings`, so the
+    /// caller saves them. Most keys only drive the engine.
     #[allow(clippy::too_many_arguments)]
     pub fn handle_key(
         &mut self,
@@ -353,6 +359,22 @@ impl RemixUi {
         settings: &mut Settings,
         sink: &dyn RemixSink,
     ) -> bool {
+        let before = settings.clone();
+        self.map_key(key, pressed, shift, now, state, settings, sink);
+        *settings != before
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn map_key(
+        &mut self,
+        key: Key,
+        pressed: bool,
+        shift: bool,
+        now: f64,
+        state: &RemixState,
+        settings: &mut Settings,
+        sink: &dyn RemixSink,
+    ) {
         let deck_cmd = |d: usize, c: DeckCmd| sink.send(RemixCmd::Deck(d, c));
         // Held keys first (they care about release).
         match key {
@@ -360,48 +382,19 @@ impl RemixUi {
                 let d = if matches!(key, Key::Z | Key::X) { 0 } else { 1 };
                 let dir = if matches!(key, Key::Z | Key::N) { -1.0 } else { 1.0 };
                 deck_cmd(d, DeckCmd::Nudge(if pressed { dir } else { 0.0 }));
-                return true;
+                return;
             }
             Key::E | Key::R | Key::U | Key::I => {
                 let d = if matches!(key, Key::E | Key::R) { 0 } else { 1 };
                 let up = matches!(key, Key::R | Key::I);
                 self.filter_keys[d][up as usize] = pressed;
-                return true;
+                return;
             }
             _ => {}
         }
+        // Everything else acts on presses only.
         if !pressed {
-            return matches!(
-                key,
-                Key::Num1
-                    | Key::Num2
-                    | Key::Num3
-                    | Key::Num4
-                    | Key::Num7
-                    | Key::Num8
-                    | Key::Num9
-                    | Key::Num0
-                    | Key::Q
-                    | Key::P
-                    | Key::W
-                    | Key::O
-                    | Key::A
-                    | Key::S
-                    | Key::D
-                    | Key::F
-                    | Key::G
-                    | Key::H
-                    | Key::J
-                    | Key::K
-                    | Key::L
-                    | Key::Semicolon
-                    | Key::C
-                    | Key::Comma
-                    | Key::ArrowLeft
-                    | Key::ArrowDown
-                    | Key::ArrowRight
-                    | Key::Space
-            );
+            return;
         }
         let hot = |k: Key| -> Option<(usize, usize)> {
             Some(match k {
@@ -425,7 +418,7 @@ impl RemixUi {
                     DeckCmd::HotCue(i)
                 },
             );
-            return true;
+            return;
         }
         let loop_key = |k: Key| -> Option<(usize, f32)> {
             Some(match k {
@@ -442,7 +435,7 @@ impl RemixUi {
         };
         if let Some((d, beats)) = loop_key(key) {
             deck_cmd(d, DeckCmd::BeatLoop(beats));
-            return true;
+            return;
         }
         match key {
             Key::Q | Key::P => {
@@ -467,9 +460,8 @@ impl RemixUi {
             Key::ArrowDown => self.glide_crossfader(0.5, now, sink),
             Key::ArrowRight => self.glide_crossfader(1.0, now, sink),
             Key::Space => self.auto_transition(state, settings, now, sink),
-            _ => return false,
+            _ => {}
         }
-        true
     }
 
     /// Release everything that is held (tab switch, focus loss).
@@ -497,7 +489,7 @@ impl RemixUi {
             self.say("Transição cancelada.", now);
             return;
         }
-        let to = if self.mix.crossfader < 0.5 { 1 } else { 0 };
+        let to = incoming_deck(state, self.mix.crossfader);
         if !state.decks[to].loaded {
             self.say(
                 format!("Carregue uma faixa no deck {} para a transição.", DECK_NAMES[to]),
@@ -520,8 +512,22 @@ impl RemixUi {
         );
     }
 
-    pub fn tap(&mut self, d: usize, now: f64, settings: &mut Settings, sink: &dyn RemixSink) -> bool {
-        let Some(bpm) = self.decks[d].tap.tap(now) else {
+    /// One press of TAP. The taps measure the tempo the DJ hears, so the deck's
+    /// fader and speed are undone before it is stored as the base tempo.
+    pub fn tap(
+        &mut self,
+        d: usize,
+        now: f64,
+        ds: &DeckState,
+        settings: &mut Settings,
+        sink: &dyn RemixSink,
+    ) -> bool {
+        let Some(heard) = self.decks[d].tap.tap(now) else {
+            return false;
+        };
+        let Some(bpm) = base_bpm_from_heard(heard, ds) else {
+            // A stray burst of taps: start the series over so it does not skew the next ones.
+            self.decks[d].tap.reset();
             return false;
         };
         sink.send(RemixCmd::Deck(d, DeckCmd::SetBpm(bpm)));
@@ -692,7 +698,7 @@ impl RemixUi {
                     let h = bin.peak.clamp(0.0, 1.0) * half_h;
                     painter.line_segment(
                         [Pos2::new(x, mid_y - h), Pos2::new(x, mid_y + h)],
-                        Stroke::new(1.0, band_color(bin.low, bin.mid, bin.high)),
+                        Stroke::new(1.0_f32, band_color(bin.low, bin.mid, bin.high)),
                     );
                 }
                 x += 1.0;
@@ -711,7 +717,7 @@ impl RemixUi {
                 let bar = n.rem_euclid(4) == 0;
                 painter.line_segment(
                     [Pos2::new(x, rect.top()), Pos2::new(x, rect.top() + if bar { 12.0 } else { 6.0 })],
-                    Stroke::new(if bar { 1.5 } else { 1.0 }, Color32::from_white_alpha(if bar { 150 } else { 70 })),
+                    Stroke::new(if bar { 1.5_f32 } else { 1.0_f32 }, Color32::from_white_alpha(if bar { 150 } else { 70 })),
                 );
             }
         }
@@ -722,7 +728,7 @@ impl RemixUi {
                 if x >= rect.left() && x <= rect.right() {
                     painter.line_segment(
                         [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                        Stroke::new(1.5, CUE_COLORS[i]),
+                        Stroke::new(1.5_f32, CUE_COLORS[i]),
                     );
                     painter.text(
                         Pos2::new(x + 3.0, rect.bottom() - 4.0),
@@ -751,7 +757,7 @@ impl RemixUi {
                 Pos2::new(rect.center().x, rect.top()),
                 Pos2::new(rect.center().x, rect.bottom()),
             ],
-            Stroke::new(2.0, FG),
+            Stroke::new(2.0_f32, FG),
         );
 
         // Drag on the zoomed waveform scrubs (only while paused).
@@ -790,7 +796,7 @@ impl RemixUi {
                 let h = peak.clamp(0.0, 1.0) * (rect.height() * 0.5 - 2.0);
                 painter.line_segment(
                     [Pos2::new(x, rect.center().y - h), Pos2::new(x, rect.center().y + h)],
-                    Stroke::new(1.0, band_color(lo, mi, hi).gamma_multiply(0.85)),
+                    Stroke::new(1.0_f32, band_color(lo, mi, hi).gamma_multiply(0.85)),
                 );
             }
         }
@@ -806,13 +812,13 @@ impl RemixUi {
                 let x = x_of(*t);
                 painter.line_segment(
                     [Pos2::new(x, rect.top()), Pos2::new(x, rect.top() + 8.0)],
-                    Stroke::new(2.0, CUE_COLORS[i]),
+                    Stroke::new(2.0_f32, CUE_COLORS[i]),
                 );
             }
         }
         painter.line_segment(
             [Pos2::new(played, rect.top()), Pos2::new(played, rect.bottom())],
-            Stroke::new(1.5, FG),
+            Stroke::new(1.5_f32, FG),
         );
         if (response.clicked() || response.dragged()) && ds.duration_secs > 0.0 {
             if let Some(p) = response.interact_pointer_pos() {
@@ -971,7 +977,7 @@ impl RemixUi {
                             cmd(DeckCmd::Nudge(0.0));
                         }
                     }
-                    if chip(ui, "TAP", false).clicked() && self.tap(d, now, settings, sink) {
+                    if chip(ui, "TAP", false).clicked() && self.tap(d, now, ds, settings, sink) {
                         changed = true;
                     }
                     if chip(ui, "grid aqui", false)
@@ -1269,7 +1275,7 @@ impl RemixUi {
                                     self.library.selected = Some(e.path.clone());
                                 }
                                 if r.double_clicked() {
-                                    let d = if self.mix.crossfader < 0.5 { 1 } else { 0 };
+                                    let d = load_target(state, self.mix.crossfader);
                                     load = Some((d, e.path.clone()));
                                 }
                             });
@@ -1306,6 +1312,46 @@ struct DeckKeys {
 
 const EQ_IDS: [[&str; 3]; DECKS] = [["eq-a-low", "eq-a-mid", "eq-a-high"], ["eq-b-low", "eq-b-mid", "eq-b-high"]];
 const FILTER_IDS: [&str; DECKS] = ["filter-a", "filter-b"];
+
+/// Deck the automatic transition brings in: the one the audience is not
+/// hearing. The crossfader only breaks ties.
+fn incoming_deck(state: &RemixState, xf: f32) -> usize {
+    let (ga, gb) = remix::dsp::crossfader_gains(xf, state.curve);
+    let gains = [ga, gb];
+    let heard = |d: usize| state.decks[d].playing && state.volume[d] * gains[d] > 1e-3;
+    match (heard(0), heard(1)) {
+        (true, false) => 1,
+        (false, true) => 0,
+        (true, true) => state.master_deck.map_or(usize::from(xf < 0.5), |m| 1 - m),
+        // Nothing heard: bring in a deck playing behind the crossfader,
+        // else the side the crossfader is away from.
+        (false, false) => match (state.decks[0].playing, state.decks[1].playing) {
+            (true, false) => 0,
+            (false, true) => 1,
+            _ => usize::from(xf < 0.5),
+        },
+    }
+}
+
+/// Deck a double-click loads onto: one that is not playing, an empty one first.
+fn load_target(state: &RemixState, xf: f32) -> usize {
+    match (state.decks[0].playing, state.decks[1].playing) {
+        (true, false) => 1,
+        (false, true) => 0,
+        (false, false) if !state.decks[0].loaded => 0,
+        (false, false) if !state.decks[1].loaded => 1,
+        _ => incoming_deck(state, xf),
+    }
+}
+
+/// The base tempo a TAP sets, from the tempo the DJ heard. The deck shows
+/// `base * speed` with `speed = 1 + fader * range` (the momentary nudge is not
+/// part of it), so the fader is divided out. `None` outside the deck's 30..=300.
+fn base_bpm_from_heard(heard: f64, ds: &DeckState) -> Option<f64> {
+    let tempo = 1.0 + f64::from(ds.tempo_fader) * f64::from(ds.tempo_range);
+    let bpm = heard / tempo;
+    (bpm.is_finite() && (30.0..=300.0).contains(&bpm)).then_some(bpm)
+}
 
 /// Position / remaining time, e.g. `1:02.5 / -3:10.0`.
 fn time_readout(ds: &DeckState) -> RichText {
@@ -1382,6 +1428,10 @@ fn fmt_filter(p: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    use remix::engine::AutoTransitionState;
+    use remix::{Analysis, RemixEngine};
 
     #[test]
     fn time_format() {
@@ -1399,5 +1449,297 @@ mod tests {
     fn gain_readout() {
         assert_eq!(fmt_gain_db(1.0), "+0 dB");
         assert_eq!(fmt_gain_db(0.0), "-∞");
+    }
+
+    const SR: u32 = 48_000;
+
+    /// A stereo sine track of `secs` seconds with the given analysed tempo.
+    fn tone(title: &str, secs: f64, bpm: Option<f64>) -> Arc<Track> {
+        let frames = (secs * f64::from(SR)).round() as usize;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (0.3 * (std::f64::consts::TAU * 220.0 * i as f64 / f64::from(SR)).sin()) as f32;
+            samples.push(v);
+            samples.push(v);
+        }
+        let analysis = Analysis {
+            bpm,
+            first_beat_secs: 0.0,
+            confidence: 1.0,
+        };
+        Arc::new(Track::from_samples(title, samples, SR, analysis))
+    }
+
+    /// The Remix UI wired to a real engine: what the UI sends, the engine applies.
+    struct Rig {
+        engine: RefCell<RemixEngine>,
+        ui: RemixUi,
+        settings: Settings,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let settings = Settings::default();
+            Self {
+                engine: RefCell::new(RemixEngine::new(SR as f32)),
+                ui: RemixUi::new(SR, &settings),
+                settings,
+            }
+        }
+
+        fn send(&self, cmd: RemixCmd) {
+            self.engine.borrow_mut().handle(cmd);
+        }
+
+        fn load(&self, deck: usize, track: Arc<Track>, play: bool) {
+            self.send(RemixCmd::Deck(deck, DeckCmd::Load(track)));
+            if play {
+                self.send(RemixCmd::Deck(deck, DeckCmd::Play));
+            }
+        }
+
+        fn state(&self) -> RemixState {
+            self.engine.borrow().state()
+        }
+
+        /// Press a key on the Remix map; returns whether settings changed.
+        fn key(&mut self, key: Key, now: f64) -> bool {
+            let state = self.state();
+            let engine = &self.engine;
+            let sink = |c: RemixCmd| {
+                engine.borrow_mut().handle(c);
+            };
+            self.ui.handle_key(key, true, false, now, &state, &mut self.settings, &sink)
+        }
+
+        fn tick(&mut self, now: f64) {
+            let state = self.state();
+            let engine = &self.engine;
+            let sink = |c: RemixCmd| {
+                engine.borrow_mut().handle(c);
+            };
+            self.ui.tick(now, &state, &mut self.settings, &sink);
+        }
+    }
+
+    /// Deck A playing, B loaded and paused: the usual set-up before a transition.
+    fn a_playing_b_paused() -> Rig {
+        let rig = Rig::new();
+        rig.load(0, tone("a", 10.0, Some(120.0)), true);
+        rig.load(1, tone("b", 10.0, Some(120.0)), false);
+        rig
+    }
+
+    #[test]
+    fn space_with_centred_crossfader_brings_in_the_paused_deck() {
+        let mut rig = a_playing_b_paused();
+        assert_eq!(rig.ui.mix.crossfader, 0.5);
+        rig.key(Key::Space, 1.0);
+        let st = rig.state();
+        assert_eq!(st.auto.map(|a| a.to), Some(1));
+        assert!(st.decks[1].playing, "B must start");
+    }
+
+    #[test]
+    fn space_after_left_then_down_brings_in_the_paused_deck() {
+        let mut rig = a_playing_b_paused();
+        rig.key(Key::ArrowLeft, 0.0);
+        rig.tick(0.2);
+        rig.key(Key::ArrowDown, 0.3);
+        rig.tick(0.5);
+        assert_eq!(rig.ui.mix.crossfader, 0.5);
+        rig.key(Key::Space, 0.6);
+        let st = rig.state();
+        assert_eq!(st.auto.map(|a| a.to), Some(1));
+        assert!(st.decks[1].playing, "B must start");
+    }
+
+    #[test]
+    fn left_glide_with_a_paused_and_b_playing_brings_in_b() {
+        // B is the deck playing behind the crossfader, so it is the one brought in.
+        let mut rig = Rig::new();
+        rig.load(0, tone("a", 10.0, Some(120.0)), false);
+        rig.load(1, tone("b", 10.0, Some(120.0)), true);
+        rig.key(Key::ArrowLeft, 0.0);
+        rig.tick(0.2);
+        rig.key(Key::Space, 0.3);
+        assert_eq!(rig.state().auto.map(|a| a.to), Some(1));
+    }
+
+    #[test]
+    fn space_with_centred_crossfader_and_b_playing_brings_in_a() {
+        let mut rig = Rig::new();
+        rig.load(0, tone("a", 10.0, Some(120.0)), false);
+        rig.load(1, tone("b", 10.0, Some(120.0)), true);
+        rig.key(Key::Space, 0.1);
+        let st = rig.state();
+        assert_eq!(st.auto.map(|a| a.to), Some(0));
+        assert!(st.decks[0].playing, "A must start");
+    }
+
+    /// Remix state with each deck's (loaded, playing) and the given master.
+    fn remix_state(decks: [(bool, bool); 2], master: Option<usize>) -> RemixState {
+        let mut st = RemixState {
+            volume: [1.0; DECKS],
+            crossfader: 0.5,
+            master_deck: master,
+            ..Default::default()
+        };
+        for (d, (loaded, playing)) in decks.into_iter().enumerate() {
+            st.decks[d].loaded = loaded;
+            st.decks[d].playing = playing;
+        }
+        st
+    }
+
+    #[test]
+    fn load_target_table() {
+        let empty = (false, false);
+        assert_eq!(load_target(&remix_state([empty, empty], None), 0.5), 0, "empty -> A");
+        assert_eq!(load_target(&remix_state([(true, false), empty], None), 0.5), 1, "A loaded -> B");
+        assert_eq!(load_target(&remix_state([(true, true), empty], None), 0.5), 1, "A playing -> B");
+        assert_eq!(load_target(&remix_state([(true, false), (true, true)], None), 0.5), 0, "B playing -> A");
+    }
+
+    #[test]
+    fn incoming_deck_brings_in_the_deck_the_audience_is_not_hearing() {
+        // A heard at centre -> B; B heard -> A.
+        assert_eq!(incoming_deck(&remix_state([(true, true), (false, false)], None), 0.5), 1);
+        assert_eq!(incoming_deck(&remix_state([(false, false), (true, true)], None), 0.5), 0);
+        // Both heard at centre: the one not carrying the mix goes.
+        assert_eq!(incoming_deck(&remix_state([(true, true), (true, true)], Some(0)), 0.5), 1);
+        assert_eq!(incoming_deck(&remix_state([(true, true), (true, true)], Some(1)), 0.5), 0);
+        // Nothing heard, nothing playing: the side the crossfader is away from.
+        assert_eq!(incoming_deck(&remix_state([(true, false), (true, false)], None), 0.25), 1);
+        assert_eq!(incoming_deck(&remix_state([(true, false), (true, false)], None), 0.75), 0);
+    }
+
+    fn heard_ds(fader: f32, range: f32) -> DeckState {
+        DeckState {
+            tempo_fader: fader,
+            tempo_range: range,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tap_converts_the_heard_tempo_to_the_base_tempo() {
+        // A 120 BPM track at +8 % is heard at 129.6.
+        // (129.6 is not exactly 120 * 1.08 in binary, hence the tolerance.)
+        let base = base_bpm_from_heard(129.6, &heard_ds(1.0, 0.08)).unwrap();
+        assert!((base - 120.0).abs() < 1e-6, "base {base}");
+        // Fader at -1 on the ±50 range: the tempo is halved.
+        let base = base_bpm_from_heard(60.0, &heard_ds(-1.0, 0.5)).unwrap();
+        assert!((base - 120.0).abs() < 1e-9, "base {base}");
+        // Centred fader: nothing to undo.
+        assert_eq!(base_bpm_from_heard(128.0, &heard_ds(0.0, 0.08)), Some(128.0));
+    }
+
+    #[test]
+    fn tap_result_is_checked_against_the_decks_range_after_conversion() {
+        let ds = heard_ds(0.0, 0.08);
+        assert_eq!(base_bpm_from_heard(29.9, &ds), None);
+        assert_eq!(base_bpm_from_heard(30.0, &ds), Some(30.0));
+        assert_eq!(base_bpm_from_heard(300.0, &ds), Some(300.0));
+        assert_eq!(base_bpm_from_heard(300.1, &ds), None);
+        // 400 heard at +50 % is 266.7 base: inside. 500 heard is 333.3 base: outside.
+        assert_eq!(base_bpm_from_heard(400.0, &heard_ds(1.0, 0.5)), Some(400.0 / 1.5));
+        assert_eq!(base_bpm_from_heard(500.0, &heard_ds(1.0, 0.5)), None);
+    }
+
+    #[test]
+    fn tap_on_a_pitched_deck_sends_and_stores_the_base_tempo() {
+        let mut rig = Rig::new();
+        let track = tone("a", 1.0, None);
+        rig.ui.decks[0].track = Some(track.clone());
+        let ds = heard_ds(1.0, 0.08);
+        let sent = RefCell::new(Vec::new());
+        let sink = |c: RemixCmd| sent.borrow_mut().push(c);
+        // Eight taps at the heard 129.6 BPM.
+        let interval = 60.0 / 129.6;
+        for i in 0..8 {
+            rig.ui.tap(0, f64::from(i) * interval, &ds, &mut rig.settings, &sink);
+        }
+        let bpms: Vec<f64> = sent
+            .borrow()
+            .iter()
+            .filter_map(|c| match c {
+                RemixCmd::Deck(0, DeckCmd::SetBpm(b)) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        let last = *bpms.last().expect("the taps set a tempo");
+        assert!((last - 120.0).abs() < 1e-6, "sent {last}");
+        assert_eq!(rig.settings.memo(&track.path).bpm, Some(120.0));
+    }
+
+    #[test]
+    fn rejected_tap_is_not_sent_and_resets_the_series() {
+        let mut rig = Rig::new();
+        let ds = heard_ds(0.0, 0.08);
+        let sent = RefCell::new(Vec::new());
+        let sink = |c: RemixCmd| sent.borrow_mut().push(c);
+        // Three fast taps: 600 BPM, outside the deck's range, so dropped.
+        for t in [0.0, 0.1, 0.2] {
+            rig.ui.tap(0, t, &ds, &mut rig.settings, &sink);
+        }
+        assert!(sent.borrow().is_empty());
+        // A steady 120 BPM afterwards must not be dragged by the burst.
+        for t in [0.8, 1.3, 1.8] {
+            rig.ui.tap(0, t, &ds, &mut rig.settings, &sink);
+        }
+        let bpms: Vec<f64> = sent
+            .borrow()
+            .iter()
+            .filter_map(|c| match c {
+                RemixCmd::Deck(0, DeckCmd::SetBpm(b)) => Some(*b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bpms.len(), 1, "{bpms:?}");
+        assert!((bpms[0] - 120.0).abs() < 1e-9, "sent {}", bpms[0]);
+    }
+
+    #[test]
+    fn crossfader_readout_follows_a_transition_to_its_last_value() {
+        let mut ui = RemixUi::new(SR, &Settings::default());
+        let mut settings = Settings::default();
+        let sink = |_: RemixCmd| {};
+        let mut st = RemixState {
+            crossfader: 0.98,
+            auto: Some(AutoTransitionState { to: 1, progress: 0.9 }),
+            ..Default::default()
+        };
+        ui.tick(0.0, &st, &mut settings, &sink);
+        assert!((ui.mix.crossfader - 0.98).abs() < 1e-6);
+        // The engine ends the transition at exactly 1: the slider must get it.
+        st.auto = None;
+        st.crossfader = 1.0;
+        ui.tick(0.1, &st, &mut settings, &sink);
+        assert_eq!(ui.mix.crossfader, 1.0);
+    }
+
+    #[test]
+    fn release_keys_stops_the_sweep_and_the_nudges() {
+        let mut ui = RemixUi::new(SR, &Settings::default());
+        ui.filter_keys = [[true, false], [false, true]];
+        let sent = RefCell::new(Vec::new());
+        ui.release_keys(&|c: RemixCmd| sent.borrow_mut().push(c));
+        assert_eq!(ui.filter_keys, [[false; 2]; DECKS]);
+        let sent = sent.into_inner();
+        for d in 0..DECKS {
+            assert!(
+                sent.iter().any(|c| matches!(c, RemixCmd::Deck(n, DeckCmd::Nudge(v)) if *n == d && *v == 0.0)),
+                "deck {d} nudge not released"
+            );
+        }
+    }
+
+    #[test]
+    fn remix_key_that_only_drives_the_engine_reports_no_settings_change() {
+        let mut rig = Rig::new();
+        rig.load(0, tone("a", 2.0, Some(120.0)), false);
+        assert!(!rig.key(Key::Q, 0.0), "play must not dirty the settings");
+        assert!(rig.state().decks[0].playing, "Q still plays");
     }
 }

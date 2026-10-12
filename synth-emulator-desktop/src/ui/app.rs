@@ -29,6 +29,9 @@ enum Tab {
     Remix,
 }
 
+/// One key event: (physical key, logical key, pressed, repeat, modifiers).
+type KeyEvent = (Key, Key, bool, bool, egui::Modifiers);
+
 /// Values the XY pad can read, copied out so the pad can borrow them while
 /// the app is mutably borrowed.
 #[derive(Clone, Copy)]
@@ -91,6 +94,8 @@ pub struct HelixApp {
     peak: f32,
     was_dragging_bend: bool,
     midi_poll_at: f64,
+    /// The sustain pedal is down because Space set it (not a MIDI pedal).
+    space_pedal: bool,
 }
 
 impl HelixApp {
@@ -127,6 +132,19 @@ impl HelixApp {
             remix.send_echo(&|c| a.send_remix(c));
         }
 
+        Self::from_parts(settings, remix, audio, audio_err, midi, guitar, gt100)
+    }
+
+    /// The app around its hardware. `new` supplies the real devices; tests pass none.
+    fn from_parts(
+        settings: Settings,
+        remix: RemixUi,
+        audio: Option<AudioHost>,
+        audio_err: Option<String>,
+        midi: Option<MidiHub>,
+        guitar: Option<GuitarInput>,
+        gt100: Option<Gt100Hub>,
+    ) -> Self {
         Self {
             tab: Tab::Synth,
             settings,
@@ -169,6 +187,7 @@ impl HelixApp {
             peak: 0.0,
             was_dragging_bend: false,
             midi_poll_at: 0.0,
+            space_pedal: false,
         }
     }
 
@@ -180,8 +199,11 @@ impl HelixApp {
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
-        // Physical keys, so the map stays put on ABNT2 and other layouts.
-        let events: Vec<(Key, bool, bool, egui::Modifiers)> = ctx.input(|i| {
+        // One entry per key event as (physical, logical, pressed, repeat,
+        // modifiers); `None` is the window losing focus. Physical keys place the
+        // notes and the Remix map, so they stay put on ABNT2 and other layouts.
+        // The logical key carries the octave keys, which follow the printed `[` `]`.
+        let inputs: Vec<Option<KeyEvent>> = ctx.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
@@ -191,14 +213,23 @@ impl HelixApp {
                         pressed,
                         repeat,
                         modifiers,
-                    } => Some((physical_key.unwrap_or(*key), *pressed, *repeat, *modifiers)),
+                    } => Some(Some((physical_key.unwrap_or(*key), *key, *pressed, *repeat, *modifiers))),
+                    egui::Event::WindowFocused(false) => Some(None),
                     _ => None,
                 })
                 .collect()
         });
         let time = ctx.input(|i| i.time);
-        for (key, pressed, repeat, modifiers) in events {
-            if modifiers.ctrl || modifiers.mac_cmd || modifiers.alt || repeat {
+        for input in inputs {
+            let Some((key, logical, pressed, repeat, modifiers)) = input else {
+                // Focus lost: the releases will not arrive, so let go of everything.
+                self.release_synth_keys(time);
+                self.release_remix_keys();
+                continue;
+            };
+            // Only new presses are filtered. A release always gets through, so
+            // a key held across Ctrl, Alt or Cmd cannot stick.
+            if pressed && (modifiers.ctrl || modifiers.mac_cmd || modifiers.alt || repeat) {
                 continue;
             }
             if matches!(key, Key::F1 | Key::F2 | Key::F10 | Key::Escape) {
@@ -223,11 +254,12 @@ impl HelixApp {
                 }
                 continue;
             }
-            if typing {
+            // Typing in a text field holds back new presses; releases still count.
+            if typing && pressed {
                 continue;
             }
             match self.tab {
-                Tab::Synth => self.synth_key(key, pressed, time),
+                Tab::Synth => self.synth_key(key, logical, pressed, time),
                 Tab::Remix => {
                     let audio = &self.audio;
                     let sink = |c: RemixCmd| {
@@ -274,17 +306,16 @@ impl HelixApp {
         self.bend = 0.0;
     }
 
-    fn synth_key(&mut self, key: Key, pressed: bool, time: f64) {
+    /// `key` is the physical key (notes, bend, sustain); `logical` is the key as
+    /// printed, which the octave keys use.
+    fn synth_key(&mut self, key: Key, logical: Key, pressed: bool, time: f64) {
         if key == Key::Space {
+            self.space_pedal = pressed;
             self.send(Command::SetPedal(pressed));
             return;
         }
-        if pressed && key == Key::OpenBracket {
-            self.shift_octave(-1);
-            return;
-        }
-        if pressed && key == Key::CloseBracket {
-            self.shift_octave(1);
+        if let Some(step) = octave_step(logical, pressed) {
+            self.shift_octave(step);
             return;
         }
         if key == Key::ArrowUp || key == Key::ArrowDown {
@@ -344,28 +375,38 @@ impl HelixApp {
             self.exit_xy(ctx);
         }
         match self.tab {
-            Tab::Synth => {
-                let held: Vec<u8> = self.key_held.drain().map(|(_, m)| m).collect();
-                for midi in held {
-                    self.send(Command::NoteOff { midi });
-                }
-                if self.arrow_up || self.arrow_down {
-                    self.arrow_up = false;
-                    self.arrow_down = false;
-                    self.spring_from = Some((self.bend, ctx.input(|i| i.time)));
-                }
-                self.send(Command::SetPedal(false));
-            }
-            Tab::Remix => {
-                let audio = &self.audio;
-                self.remix.release_keys(&|c: RemixCmd| {
-                    if let Some(a) = audio {
-                        a.send_remix(c);
-                    }
-                });
-            }
+            Tab::Synth => self.release_synth_keys(ctx.input(|i| i.time)),
+            Tab::Remix => self.release_remix_keys(),
         }
         self.tab = tab;
+    }
+
+    /// Let go of the synth's held input: keys, the Space pedal and the arrow bend.
+    fn release_synth_keys(&mut self, time: f64) {
+        let held: Vec<u8> = self.key_held.drain().map(|(_, m)| m).collect();
+        for midi in held {
+            self.send(Command::NoteOff { midi });
+        }
+        if self.arrow_up || self.arrow_down {
+            self.arrow_up = false;
+            self.arrow_down = false;
+            self.spring_from = Some((self.bend, time));
+        }
+        // Only the pedal that Space set: CC64 from a MIDI pedal is the same flag.
+        if self.space_pedal {
+            self.space_pedal = false;
+            self.send(Command::SetPedal(false));
+        }
+    }
+
+    /// Let go of the Remix keys: the filter sweeps and the nudges.
+    fn release_remix_keys(&mut self) {
+        let audio = &self.audio;
+        self.remix.release_keys(&|c: RemixCmd| {
+            if let Some(a) = audio {
+                a.send_remix(c);
+            }
+        });
     }
 
     fn xy_targets(&self) -> [XyTarget; 2] {
@@ -503,7 +544,7 @@ impl eframe::App for HelixApp {
         }
         self.remix.handle_dropped_files(ctx, &self.remix_state, now);
         if self.tab == Tab::Synth && ctx.input(|i| !i.raw.dropped_files.is_empty()) {
-            self.tab = Tab::Remix;
+            self.switch_tab(ctx, Tab::Remix);
         }
 
         let targets = self.xy_targets();
@@ -522,7 +563,7 @@ impl eframe::App for HelixApp {
         if let Some(t) = self.settings_dirty_at {
             if now - t > 1.5 {
                 if let Err(e) = self.settings.save() {
-                    eprintln!("helix: could not save settings: {e}");
+                    crate::log::warn(&format!("could not save settings: {e}"));
                 }
                 self.settings_dirty_at = None;
             }
@@ -620,8 +661,12 @@ impl eframe::App for HelixApp {
 
 impl Drop for HelixApp {
     fn drop(&mut self) {
-        if let Err(e) = self.settings.save() {
-            eprintln!("helix: could not save settings: {e}");
+        // Test apps have no window: they must not overwrite the user's settings file.
+        #[cfg(not(test))]
+        {
+            if let Err(e) = self.settings.save() {
+                crate::log::warn(&format!("could not save settings: {e}"));
+            }
         }
     }
 }
@@ -1282,6 +1327,16 @@ fn midi_picker(ui: &mut egui::Ui, app: &mut HelixApp) {
     });
 }
 
+/// Octave step for a press of the printed `[` (down) or `]` (up). It reads the
+/// logical key: on ABNT2 the key printed `[` sits where US has `]`.
+fn octave_step(logical: Key, pressed: bool) -> Option<i32> {
+    match (pressed, logical) {
+        (true, Key::OpenBracket) => Some(-1),
+        (true, Key::CloseBracket) => Some(1),
+        _ => None,
+    }
+}
+
 fn computer_key_offset(key: Key) -> Option<u8> {
     Some(match key {
         Key::Z => 0,
@@ -1337,4 +1392,196 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(HelixApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Event, Modifiers, Pos2, RawInput, Rect, Vec2};
+    use eframe::App as _;
+    use std::path::PathBuf;
+
+    /// The app with no audio, MIDI or guitar: keys reach its state and nothing else.
+    fn app() -> HelixApp {
+        let settings = Settings::default();
+        let remix = RemixUi::new(48_000, &settings);
+        HelixApp::from_parts(settings, remix, None, None, None, None, None)
+    }
+
+    fn remix_app() -> HelixApp {
+        let mut app = app();
+        app.tab = Tab::Remix;
+        app
+    }
+
+    fn raw_input(time: f64, events: Vec<Event>) -> RawInput {
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 860.0))),
+            focused: true,
+            time: Some(time),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn key(key: Key, physical: Key, pressed: bool, modifiers: Modifiers) -> Event {
+        Event::Key {
+            key,
+            physical_key: Some(physical),
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Routes one frame of key events through the app, as `update` does.
+    fn send_keys(app: &mut HelixApp, ctx: &egui::Context, events: Vec<Event>) {
+        let _ = ctx.run(raw_input(0.0, events), |ctx| app.handle_keys(ctx));
+    }
+
+    #[test]
+    fn abnt2_open_bracket_lowers_the_octave() {
+        // ABNT2: the key printed '[' is the physical US ']' (CloseBracket).
+        let ctx = egui::Context::default();
+        let mut app = app();
+        assert_eq!(app.octave, 3);
+        send_keys(&mut app, &ctx, vec![key(Key::OpenBracket, Key::CloseBracket, true, Modifiers::NONE)]);
+        assert_eq!(app.octave, 2);
+    }
+
+    #[test]
+    fn abnt2_close_bracket_raises_the_octave() {
+        // ABNT2: the key printed ']' is the physical Backslash.
+        let ctx = egui::Context::default();
+        let mut app = app();
+        send_keys(&mut app, &ctx, vec![key(Key::CloseBracket, Key::Backslash, true, Modifiers::NONE)]);
+        assert_eq!(app.octave, 4);
+    }
+
+    #[test]
+    fn us_brackets_move_the_octave_down_and_up() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        send_keys(&mut app, &ctx, vec![key(Key::OpenBracket, Key::OpenBracket, true, Modifiers::NONE)]);
+        assert_eq!(app.octave, 2);
+        send_keys(&mut app, &ctx, vec![key(Key::CloseBracket, Key::CloseBracket, true, Modifiers::NONE)]);
+        assert_eq!(app.octave, 3);
+    }
+
+    #[test]
+    fn octave_step_reads_the_printed_key_and_only_presses() {
+        assert_eq!(octave_step(Key::OpenBracket, true), Some(-1));
+        assert_eq!(octave_step(Key::CloseBracket, true), Some(1));
+        assert_eq!(octave_step(Key::OpenBracket, false), None);
+        assert_eq!(octave_step(Key::Z, true), None);
+    }
+
+    /// Runs the Remix ticks from `from` for `secs`, in 0.1 s steps.
+    fn tick_remix(app: &mut HelixApp, from: f64, secs: f64) {
+        let state = app.remix_state;
+        let sink = |_: RemixCmd| {};
+        let steps = (secs / 0.1).round() as usize;
+        for i in 1..=steps {
+            app.remix.tick(from + i as f64 * 0.1, &state, &mut app.settings, &sink);
+        }
+    }
+
+    /// Holds E on the Remix tab, then sends `after`; returns the filter knob
+    /// three seconds later.
+    fn filter_after_e_held_then(after: Vec<Event>) -> f32 {
+        let ctx = egui::Context::default();
+        let mut app = remix_app();
+        send_keys(&mut app, &ctx, vec![key(Key::E, Key::E, true, Modifiers::NONE)]);
+        send_keys(&mut app, &ctx, after);
+        tick_remix(&mut app, 0.0, 3.0);
+        app.remix.mix.filter[0]
+    }
+
+    #[test]
+    fn releasing_e_with_ctrl_down_stops_the_filter_sweep() {
+        let f = filter_after_e_held_then(vec![key(Key::E, Key::E, false, Modifiers::CTRL)]);
+        assert!(f.abs() < 1e-6, "E released, filter still swept to {f}");
+    }
+
+    #[test]
+    fn alt_tab_releases_stop_the_filter_sweep() {
+        // Windows reports Alt+Tab as the Tab press, then the releases, with Alt down,
+        // then the focus loss.
+        let f = filter_after_e_held_then(vec![
+            key(Key::Tab, Key::Tab, true, Modifiers::ALT),
+            key(Key::E, Key::E, false, Modifiers::ALT),
+            Event::WindowFocused(false),
+        ]);
+        assert!(f.abs() < 1e-6, "Alt+Tab left the filter swept to {f}");
+    }
+
+    #[test]
+    fn focus_loss_alone_stops_the_filter_sweep() {
+        // Wayland sends no key release when the window loses focus.
+        let f = filter_after_e_held_then(vec![Event::WindowFocused(false)]);
+        assert!(f.abs() < 1e-6, "focus loss left the filter swept to {f}");
+    }
+
+    #[test]
+    fn a_knob_set_back_to_zero_stays_there() {
+        let ctx = egui::Context::default();
+        let mut app = remix_app();
+        send_keys(&mut app, &ctx, vec![key(Key::E, Key::E, true, Modifiers::NONE)]);
+        send_keys(&mut app, &ctx, vec![key(Key::E, Key::E, false, Modifiers::CTRL)]);
+        app.remix.mix.filter[0] = 0.0;
+        tick_remix(&mut app, 0.0, 3.0);
+        assert_eq!(app.remix.mix.filter[0], 0.0);
+    }
+
+    #[test]
+    fn focus_loss_releases_held_synth_keys_and_the_space_pedal() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        send_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key(Key::Z, Key::Z, true, Modifiers::NONE),
+                key(Key::Space, Key::Space, true, Modifiers::NONE),
+            ],
+        );
+        assert_eq!(app.key_held.len(), 1);
+        assert!(app.space_pedal);
+        send_keys(&mut app, &ctx, vec![Event::WindowFocused(false)]);
+        assert!(app.key_held.is_empty());
+        assert!(!app.space_pedal);
+    }
+
+    #[test]
+    fn remix_key_presses_do_not_mark_the_settings_dirty() {
+        let ctx = egui::Context::default();
+        let mut app = remix_app();
+        send_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key(Key::Q, Key::Q, true, Modifiers::NONE),
+                key(Key::Q, Key::Q, false, Modifiers::NONE),
+            ],
+        );
+        assert!(app.settings_dirty_at.is_none());
+    }
+
+    #[test]
+    fn dropping_a_file_on_the_synth_tab_lets_go_of_held_notes() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        send_keys(&mut app, &ctx, vec![key(Key::Z, Key::Z, true, Modifiers::NONE)]);
+        assert_eq!(app.key_held.len(), 1);
+        let dropped = egui::DroppedFile {
+            path: Some(PathBuf::from("notas.txt")),
+            ..Default::default()
+        };
+        let mut input = raw_input(0.0, Vec::new());
+        input.dropped_files = vec![dropped];
+        let mut eframe_frame = eframe::Frame::_new_kittest();
+        let _ = ctx.run(input, |ctx| app.update(ctx, &mut eframe_frame));
+        assert_eq!(app.tab, Tab::Remix);
+        assert!(app.key_held.is_empty());
+    }
 }

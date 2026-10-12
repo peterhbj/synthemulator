@@ -54,7 +54,7 @@ IBM Plex Sans/Mono (SIL Open Font License) are bundled in `assets/fonts/`.
 |-------|--------|
 | Z row / Q row | Notes (same map as the website) |
 | Space | Sustain pedal |
-| `[` `]` | Octave down / up |
+| `[` `]` | Octave down / up. These follow the printed symbol, also on ABNT2; the note keys follow the key position. |
 | Arrow up / down | Pitch bend |
 | Esc | Panic (all notes off) |
 | MIDI notes | Play, velocity scales gain |
@@ -72,7 +72,7 @@ Refresh if you plugged in after launch; choose **None** to stop auto-connect.
 
 Two decks (A left, B right) play local files: mp3, flac, wav, ogg, m4a/aac,
 alac, aiff. Spotify and other streaming services are DRM-protected and cannot
-be loaded. Pick a music folder in the browser on the left; each track is
+be loaded. Pick a music folder in the library below the decks; each track is
 decoded into memory and analysed for tempo and a beat grid when it loads.
 Hot cues and a corrected tempo are remembered per file.
 
@@ -109,6 +109,8 @@ Each tab has its own two targets (X and Y), chosen in the row under the tabs:
 filters, EQ, crossfader, echo amount/repeats/time on Remix; cutoff, resonance,
 pitch bend on Synth. With **volta ao soltar** on, lifting the finger puts the
 parameters back where they were. Leaving the window also releases the pad.
+While the pad is active, taps and clicks do not reach Helix's own controls, so
+a tap on the pad never presses a deck button or a chip.
 
 - **Linux:** reads the touchpad directly (evdev) and grabs it, so the cursor
   stays still. Your user must be able to read `/dev/input/event*`:
@@ -116,9 +118,10 @@ parameters back where they were. Leaving the window also releases the pad.
   Helix falls back to relative mode (the cursor is hidden and confined, and
   finger movement nudges the puck), and the status line says why.
 - **Windows:** reads the Precision Touchpad through raw input and pins the
-  cursor while active. Clicks, tap-to-click and system gestures still go
-  through; turn off three/four-finger gestures if they get in the way. Without
-  a Precision Touchpad it uses relative mode.
+  cursor inside the Helix window while active. Taps and clicks do not reach
+  Helix's controls then; system gestures still go through, so turn off
+  three/four-finger gestures if they get in the way. Without a Precision
+  Touchpad it uses relative mode.
 
 ## Guitar / GT-100
 
