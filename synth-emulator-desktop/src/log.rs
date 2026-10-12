@@ -3,6 +3,7 @@
 //! well as printed to stderr.
 
 /// Largest log file kept; past this it starts over.
+#[cfg(windows)]
 const MAX_LOG_BYTES: u64 = 512 * 1024;
 
 /// Print `msg` to stderr and, on Windows, append it to the log file.
