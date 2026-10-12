@@ -178,7 +178,7 @@ fn build_stream<T>(
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let err_fn = |e| eprintln!("helix audio: {e}");
+    let err_fn = |e| crate::log::warn(&format!("audio: {e}"));
 
     let make = |cfg: &StreamConfig| {
         let rx = rx.clone();

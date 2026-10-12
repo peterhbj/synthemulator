@@ -96,7 +96,7 @@ fn paint_knob(ui: &Ui, rect: Rect, t: f32, hot: bool) {
         center,
         radius,
         Stroke::new(
-            1.0,
+            1.0_f32,
             if hot {
                 Color32::from_white_alpha(32)
             } else {
@@ -118,7 +118,7 @@ fn paint_knob(ui: &Ui, rect: Rect, t: f32, hot: bool) {
     }
     painter.add(Shape::line(
         bg,
-        Stroke::new(1.25, Color32::from_white_alpha(28)),
+        Stroke::new(1.25_f32, Color32::from_white_alpha(28)),
     ));
     let lit = (t * steps as f32).round() as usize;
     if lit > 0 {
@@ -130,7 +130,7 @@ fn paint_knob(ui: &Ui, rect: Rect, t: f32, hot: bool) {
                 center.y + r_arc * a.sin(),
             ));
         }
-        painter.add(Shape::line(fg, Stroke::new(1.75, ACCENT)));
+        painter.add(Shape::line(fg, Stroke::new(1.75_f32, ACCENT)));
     }
     let a = std::f32::consts::PI * 0.75 + t * sweep;
     let inner = Pos2::new(center.x, center.y);
@@ -138,7 +138,7 @@ fn paint_knob(ui: &Ui, rect: Rect, t: f32, hot: bool) {
         center.x + (radius - 10.0) * a.cos(),
         center.y + (radius - 10.0) * a.sin(),
     );
-    painter.line_segment([inner, outer], Stroke::new(2.0, FG));
+    painter.line_segment([inner, outer], Stroke::new(2.0_f32, FG));
 }
 
 pub fn chip(ui: &mut Ui, label: &str, active: bool) -> Response {
@@ -232,7 +232,7 @@ fn paint_wave_icon(ui: &mut Ui, rect: Rect, wave: Waveform, color: Color32, labe
             )
         })
         .collect();
-    painter.add(Shape::line(pts, Stroke::new(1.75, color)));
+    painter.add(Shape::line(pts, Stroke::new(1.75_f32, color)));
     painter.text(
         Pos2::new(rect.center().x, rect.bottom() - 8.0),
         egui::Align2::CENTER_CENTER,
@@ -266,12 +266,12 @@ pub fn volume_slider(ui: &mut Ui, volume: &mut f32) -> bool {
         let y = rect.center().y;
         painter.line_segment(
             [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-            Stroke::new(2.0, Color32::from_white_alpha(20)),
+            Stroke::new(2.0_f32, Color32::from_white_alpha(20)),
         );
         let x = rect.left() + *volume * rect.width();
         painter.line_segment(
             [Pos2::new(rect.left(), y), Pos2::new(x, y)],
-            Stroke::new(2.0, SUBTLE),
+            Stroke::new(2.0_f32, SUBTLE),
         );
         painter.circle_filled(Pos2::new(x, y), 6.0, ACCENT);
         ui.label(

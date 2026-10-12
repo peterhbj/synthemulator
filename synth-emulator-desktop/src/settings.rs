@@ -123,7 +123,7 @@ impl Settings {
             Ok(text) => match serde_json::from_str(&text) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("helix: settings ignored ({e})");
+                    crate::log::warn(&format!("settings ignored ({e})"));
                     let _ = std::fs::rename(path, path.with_extension("json.bad"));
                     Self::default()
                 }

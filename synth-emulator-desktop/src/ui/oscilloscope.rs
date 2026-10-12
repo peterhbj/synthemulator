@@ -27,7 +27,7 @@ fn paint_scope(ui: &Ui, rect: Rect, time_domain: &[f32]) {
     painter.rect_stroke(
         rect,
         theme::rounding_md(),
-        Stroke::new(1.0, Color32::from_white_alpha(18)),
+        Stroke::new(1.0_f32, Color32::from_white_alpha(18)),
         egui::StrokeKind::Outside,
     );
     painter.line_segment(
@@ -35,7 +35,7 @@ fn paint_scope(ui: &Ui, rect: Rect, time_domain: &[f32]) {
             Pos2::new(rect.left(), rect.center().y),
             Pos2::new(rect.right(), rect.center().y),
         ],
-        Stroke::new(1.0, Color32::from_white_alpha(16)),
+        Stroke::new(1.0_f32, Color32::from_white_alpha(16)),
     );
     if time_domain.len() < 2 {
         painter.text(
@@ -56,5 +56,5 @@ fn paint_scope(ui: &Ui, rect: Rect, time_domain: &[f32]) {
         let y = rect.center().y - v * 0.42 * rect.height();
         pts.push(Pos2::new(x, y.clamp(rect.top() + 2.0, rect.bottom() - 2.0)));
     }
-    painter.add(Shape::line(pts, Stroke::new(1.5, GLOW)));
+    painter.add(Shape::line(pts, Stroke::new(1.5_f32, GLOW)));
 }

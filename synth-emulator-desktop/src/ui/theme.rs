@@ -19,7 +19,7 @@ pub const KEY_SHARP_FG: Color32 = Color32::from_rgb(0xc8, 0xc8, 0xce);
 pub const GLOW: Color32 = Color32::from_rgb(0xd7, 0xde, 0xe6);
 
 pub fn panel_stroke() -> Stroke {
-    Stroke::new(1.0, Color32::from_white_alpha(18))
+    Stroke::new(1.0_f32, Color32::from_white_alpha(18))
 }
 
 pub fn rounding_xl() -> CornerRadius {
@@ -93,12 +93,12 @@ pub fn install_style(ctx: &eframe::egui::Context) {
     style.visuals.faint_bg_color = SURFACE;
     style.visuals.widgets.noninteractive.bg_fill = SURFACE;
     style.visuals.widgets.inactive.bg_fill = ELEVATED;
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, MUTED);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, MUTED);
     style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x22, 0x22, 0x28);
     style.visuals.widgets.active.bg_fill = ACCENT;
-    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0, ACCENT_FG);
+    style.visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, ACCENT_FG);
     style.visuals.selection.bg_fill = ACCENT;
-    style.visuals.selection.stroke = Stroke::new(1.0, ACCENT_FG);
+    style.visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT_FG);
     style.visuals.widgets.inactive.corner_radius = rounding_sm();
     style.visuals.widgets.hovered.corner_radius = rounding_sm();
     style.visuals.widgets.active.corner_radius = rounding_sm();

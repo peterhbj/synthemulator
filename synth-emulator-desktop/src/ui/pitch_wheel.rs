@@ -84,7 +84,7 @@ fn paint_wheel(ui: &Ui, rect: Rect, bend: f32) {
     painter.rect_stroke(
         rect,
         20.0,
-        Stroke::new(1.0, Color32::from_white_alpha(18)),
+        Stroke::new(1.0_f32, Color32::from_white_alpha(18)),
         egui::StrokeKind::Outside,
     );
     let mid_y = rect.center().y;
@@ -93,7 +93,7 @@ fn paint_wheel(ui: &Ui, rect: Rect, bend: f32) {
             Pos2::new(rect.left() + 4.0, mid_y),
             Pos2::new(rect.right() - 4.0, mid_y),
         ],
-        Stroke::new(1.0, Color32::from_white_alpha(40)),
+        Stroke::new(1.0_f32, Color32::from_white_alpha(40)),
     );
     let groove_top = mid_y - 32.0 - bend * 28.0;
     for i in 0..12 {
@@ -104,7 +104,7 @@ fn paint_wheel(ui: &Ui, rect: Rect, bend: f32) {
                     Pos2::new(rect.left() + 2.0, y),
                     Pos2::new(rect.right() - 2.0, y),
                 ],
-                Stroke::new(2.0, BORDER),
+                Stroke::new(2.0_f32, BORDER),
             );
         }
     }

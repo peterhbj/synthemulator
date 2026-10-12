@@ -139,7 +139,7 @@ where
     T: cpal::SizedSample + Sample,
     f32: cpal::FromSample<T>,
 {
-    let err_fn = |e| eprintln!("helix guitar: {e}");
+    let err_fn = |e| crate::log::warn(&format!("guitar: {e}"));
     let conv = RateConv::new(in_sr, out_sr);
     let mut try_cfg = config.clone();
     let make = |cfg: &StreamConfig| {

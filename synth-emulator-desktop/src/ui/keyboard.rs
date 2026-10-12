@@ -51,7 +51,7 @@ pub fn piano(
             ui.painter().rect_stroke(
                 key.shrink(1.0),
                 rounding,
-                egui::Stroke::new(1.0, ACCENT),
+                egui::Stroke::new(1.0_f32, ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -97,7 +97,7 @@ pub fn piano(
             ui.painter().rect_stroke(
                 key.shrink(1.0),
                 rounding,
-                egui::Stroke::new(1.0, ACCENT),
+                egui::Stroke::new(1.0_f32, ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
