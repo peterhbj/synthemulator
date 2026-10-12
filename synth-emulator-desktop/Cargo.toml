@@ -24,3 +24,7 @@ rustfft = "6.4"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# cpal 0.16 with one fix: recover from POLLERR instead of spinning on it.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

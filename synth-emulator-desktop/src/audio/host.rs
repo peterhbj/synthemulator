@@ -32,6 +32,17 @@ pub struct AudioHost {
 impl AudioHost {
     pub fn start() -> Result<Self, AudioError> {
         request_pipewire_latency();
+        if std::env::var_os("HELIX_AUDIO_DEBUG").is_some() {
+            std::thread::spawn(|| {
+                let mut last = 0;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let now = CALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("helix: audio callbacks/s: {}", now - last);
+                    last = now;
+                }
+            });
+        }
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -42,7 +53,7 @@ impl AudioHost {
             .map_err(|e| format!("output config: {e}"))?;
 
         let mut config: StreamConfig = supported.config();
-        config.buffer_size = BufferSize::Fixed(128);
+        config.buffer_size = BufferSize::Fixed(OUTPUT_FRAMES);
 
         let sample_rate = config.sample_rate.0 as f32;
         let channels = config.channels as usize;
@@ -193,6 +204,7 @@ where
         device.build_output_stream(
             cfg,
             move |data: &mut [T], _| {
+                CALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 while let Ok(cmd) = rx.try_recv() {
                     engine.handle(cmd);
                 }
@@ -257,10 +269,21 @@ fn write_frame<T: cpal::SizedSample + cpal::FromSample<f32>>(frame: &mut [T], l:
     }
 }
 
+/// Output callbacks so far; `HELIX_AUDIO_DEBUG` prints the rate.
+static CALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Quantum we ask PipeWire for. 128 starves HDMI sinks into an xrun storm.
+const QUANTUM_FRAMES: u32 = 256;
+
+/// ALSA buffer we ask for. It has to hold more than one quantum: at 128 the
+/// callback ran for a second and then never again, taking with it every
+/// command the UI sends; 256 underran constantly; 512 is the first stable size.
+const OUTPUT_FRAMES: u32 = 512;
+
 /// Ask PipeWire for a live-guitar quantum before ALSA streams open.
 pub(crate) fn request_pipewire_latency() {
     if std::env::var_os("PIPEWIRE_LATENCY").is_none() {
-        std::env::set_var("PIPEWIRE_LATENCY", "128/48000");
+        std::env::set_var("PIPEWIRE_LATENCY", format!("{QUANTUM_FRAMES}/48000"));
     }
 }
 
@@ -268,7 +291,7 @@ pub(crate) fn open_low_latency<S, E>(
     mut config: StreamConfig,
     mut make: impl FnMut(&StreamConfig) -> Result<S, E>,
 ) -> Result<S, E> {
-    for frames in [128u32, 64, 256] {
+    for frames in [OUTPUT_FRAMES, 1024] {
         config.buffer_size = BufferSize::Fixed(frames);
         if let Ok(stream) = make(&config) {
             return Ok(stream);
