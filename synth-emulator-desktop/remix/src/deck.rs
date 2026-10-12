@@ -62,7 +62,11 @@ pub enum DeckCmd {
     BeatJump(f32),
     /// Match effective BPM to `bpm` by moving the tempo fader (widening the
     /// range if needed). With `phase` (0..1, the other deck's beat phase),
-    /// also shift the playhead by less than half a beat so phases match.
+    /// also shift the playhead by less than half a beat (or, when that would
+    /// cross the start or end of the track, by less than a beat the other way)
+    /// so phases match. Inside an active loop the playhead wraps around the
+    /// loop instead, and the loop is kept. An ended deck is aligned from its
+    /// cue point, so a following Play restarts it there.
     Sync {
         bpm: f64,
         phase: Option<f64>,
@@ -102,8 +106,10 @@ pub struct DeckState {
 /// `TEMPO_RANGES` in f64, so speed arithmetic matches the decimal values
 /// exactly. A test checks that the two tables agree.
 const RANGES_F64: [f64; 3] = [0.08, 0.16, 0.50];
-/// Smallest loop the halve command may produce, in track frames.
+/// Smallest loop any command may produce, in track frames.
 const MIN_LOOP_FRAMES: f64 = 1.0;
+/// Shortest loop, in beats, for both BeatLoop and LoopHalve.
+const MIN_LOOP_BEATS: f32 = 1.0 / 32.0;
 /// Hot-cue and loop snapping tolerance, in beats.
 const SNAP_BEATS: f64 = 1.0 / 8.0;
 
@@ -663,7 +669,7 @@ impl Deck {
         if self.track.is_none() || !beats.is_finite() {
             return;
         }
-        let beats = beats.clamp(1.0 / 32.0, 64.0);
+        let beats = beats.clamp(MIN_LOOP_BEATS, 64.0);
         // Pressing the same requested length again exits the loop, even when
         // the loop was clamped at the track end.
         if let Some(region) = self.loop_region {
@@ -689,8 +695,12 @@ impl Deck {
         let Some(region) = self.loop_region else {
             return;
         };
+        // Stop at the shortest loop BeatLoop makes, and at a loop no shorter
+        // than the declick crossfade: each wrap of a shorter loop fades its
+        // live voice in from silence and the loop fades out and buzzes.
         let len = (region.end - region.start) * 0.5;
-        if len.is_nan() || len < MIN_LOOP_FRAMES {
+        let min_frames = (f64::from(DECLICK_SECS) * self.sample_rate).max(MIN_LOOP_FRAMES);
+        if len.is_nan() || len < min_frames || region.beats * 0.5 < MIN_LOOP_BEATS {
             return;
         }
         let end = region.start + len;
@@ -753,8 +763,18 @@ impl Deck {
             return;
         }
         if let Some(region) = self.loop_region {
-            let start = (region.start + applied).max(0.0);
-            let end = (region.end + applied).min(max);
+            let len = region.end - region.start;
+            let fits = region.start + applied >= 0.0 && region.end + applied <= max;
+            let (start, end) = if fits {
+                (region.start + applied, region.end + applied)
+            } else {
+                // The loop would cross a track bound. Keep its length (a loop
+                // already clamped at the track end keeps its size, and its
+                // beats label stays true) and re-anchor it inside the track so
+                // it still holds the target.
+                let start = (region.start + applied).clamp(0.0, (max - len).max(0.0));
+                (start, start + len)
+            };
             self.loop_region = if end - start >= MIN_LOOP_FRAMES {
                 Some(LoopFrames {
                     start,
@@ -803,15 +823,38 @@ impl Deck {
         let Some(other) = phase.filter(|p| p.is_finite()) else {
             return;
         };
-        let own = self.beat_phase_at(self.pos_secs()).unwrap_or(0.0);
+        // An ended deck restarts from its cue (see `play`), so its phase is
+        // aligned from there. Aligning from the end would clear `ended` and
+        // leave nothing to play.
+        let from = if self.ended { self.cue } else { self.pos };
+        let own = self.beat_phase_at(from / self.rate()).unwrap_or(0.0);
         let mut delta = (other - own).rem_euclid(1.0);
         if delta > 0.5 {
             delta -= 1.0;
         }
-        if delta.abs() > 0.0 {
-            let shift = delta * (60.0 / base) * self.rate();
-            let target = self.pos + shift;
-            self.exit_loop_if_outside(target);
+        if self.ended || delta.abs() > 0.0 {
+            let beat = (60.0 / base) * self.rate();
+            let mut target = from + delta * beat;
+            if let Some(region) = self.loop_region {
+                // A phase nudge is not a jump: inside a loop the playhead wraps
+                // around it, and the loop is kept. The wrap is by whole beats
+                // when the loop holds one or more, so the grid phase survives
+                // loops that are not a whole number of beats; a sub-beat loop
+                // wraps by its own length.
+                let len = region.end - region.start;
+                if len > 0.0 {
+                    let step = if len >= beat {
+                        ((len / beat) + 1e-9).floor() * beat
+                    } else {
+                        len
+                    };
+                    target = region.start + (target - region.start).rem_euclid(step);
+                }
+            } else if target < 0.0 {
+                target += beat;
+            } else if target > self.max_frames() {
+                target -= beat;
+            }
             self.jump_to(target);
         }
     }
@@ -1656,5 +1699,148 @@ mod tests {
             );
             prev = p;
         }
+    }
+
+    #[test]
+    fn sync_phase_is_reached_from_the_very_start_of_the_track() {
+        // A freshly loaded deck sits on its first beat, at 0 s. A phase that
+        // needs a shift backwards must wrap forward, not clamp at 0.
+        let track = make_track(SR, 4.0, Some(120.0), 0.0, sine(SR, 220.0, 0.3));
+        let mut deck = loaded(track);
+        assert!(deck.state().position_secs.abs() < 1e-9);
+        deck.handle(DeckCmd::Sync {
+            bpm: 120.0,
+            phase: Some(0.6),
+        });
+        let phase = deck.beat_phase().unwrap();
+        assert!((phase - 0.6).abs() < 0.01, "phase {phase}");
+    }
+
+    #[test]
+    fn sync_on_an_ended_deck_aligns_from_the_cue_and_play_restarts_there() {
+        let track = make_track(SR, 1.0, Some(120.0), 0.0, sine(SR, 220.0, 0.3));
+        let mut deck = loaded(track);
+        deck.handle(DeckCmd::Play);
+        run(&mut deck, SR as usize + 100);
+        assert!(deck.state().ended);
+        // Phase 0.3 at 120 BPM from the cue at 0 s is 0.15 s.
+        deck.handle(DeckCmd::Sync {
+            bpm: 120.0,
+            phase: Some(0.3),
+        });
+        let s = deck.state();
+        assert!(!s.ended, "a sync must not leave the deck ended");
+        assert!((s.position_secs - 0.15).abs() < 1e-6, "{}", s.position_secs);
+        // Play then continues from there rather than doing nothing.
+        deck.handle(DeckCmd::Play);
+        run(&mut deck, SR as usize / 4);
+        let s = deck.state();
+        assert!(s.playing && !s.ended);
+        assert!((s.position_secs - 0.4).abs() < 1e-3, "{}", s.position_secs);
+    }
+
+    #[test]
+    fn sync_inside_a_loop_wraps_around_it_and_keeps_the_loop() {
+        let track = make_track(SR, 12.0, Some(120.0), 0.0, sine(SR, 220.0, 0.3));
+        let mut deck = loaded(track);
+        seek_secs(&mut deck, 1.3);
+        deck.handle(DeckCmd::BeatLoop(4.0));
+        seek_secs(&mut deck, 1.05);
+        deck.handle(DeckCmd::Play);
+        // The playhead is at phase 0.1. Phase 0.9 needs a shift of -0.2 beats
+        // (-0.1 s), which would leave the loop at 0.95 s. It wraps to 2.95 s.
+        deck.handle(DeckCmd::Sync {
+            bpm: 120.0,
+            phase: Some(0.9),
+        });
+        let s = deck.state();
+        let lp = s.loop_state.expect("the loop survives a sync");
+        assert!((lp.start_secs - 1.0).abs() < 1e-9);
+        assert!((lp.end_secs - 3.0).abs() < 1e-9);
+        assert!((s.position_secs - 2.95).abs() < 1e-6, "{}", s.position_secs);
+        let phase = s.beat_phase.unwrap();
+        assert!((phase - 0.9).abs() < 1e-6, "phase {phase}");
+    }
+
+    #[test]
+    fn sync_inside_a_loop_of_fractional_beats_keeps_the_grid_phase() {
+        let track = make_track(SR, 12.0, Some(120.0), 0.0, sine(SR, 220.0, 0.3));
+        let mut deck = loaded(track);
+        seek_secs(&mut deck, 1.3);
+        // 1.5 beats from 1.0 s: the loop is 1.0 .. 1.75 s.
+        deck.handle(DeckCmd::BeatLoop(1.5));
+        seek_secs(&mut deck, 1.7);
+        // Phase 0.4 to 0.85: a shift of +0.45 beats lands 1.85 beats into the
+        // loop. Wrapping by the loop's 1.5 beats would miss the phase.
+        deck.handle(DeckCmd::Sync {
+            bpm: 120.0,
+            phase: Some(0.85),
+        });
+        let s = deck.state();
+        let lp = s.loop_state.expect("loop kept");
+        assert!((lp.start_secs - 1.0).abs() < 1e-9);
+        assert!((lp.end_secs - 1.75).abs() < 1e-9);
+        let phase = s.beat_phase.unwrap();
+        assert!((phase - 0.85).abs() < 1e-6, "phase {phase}");
+    }
+
+    #[test]
+    fn loop_halve_stops_at_the_shortest_loop() {
+        let track = make_track(SR, 12.0, Some(120.0), 0.0, sine(SR, 220.0, 0.5));
+        let mut deck = loaded(track);
+        seek_secs(&mut deck, 1.3);
+        deck.handle(DeckCmd::BeatLoop(1.0));
+        for _ in 0..10 {
+            deck.handle(DeckCmd::LoopHalve);
+        }
+        let lp = deck.state().loop_state.expect("loop");
+        // Halving stops at 1/32 beat, 750 frames (15.6 ms) at 120 BPM.
+        assert!((lp.beats - 1.0 / 32.0).abs() < 1e-6, "beats {}", lp.beats);
+        let frames = (lp.end_secs - lp.start_secs) * f64::from(SR);
+        assert!((frames - 750.0).abs() < 1e-3, "loop is {frames} frames");
+
+        // At that length the declick crossfade at each wrap fits inside the
+        // loop, so the loop keeps its level instead of fading to a buzz.
+        deck.handle(DeckCmd::Play);
+        run(&mut deck, 1_000);
+        let mut sum_sq = 0.0f64;
+        for _ in 0..4_800 {
+            let (l, _) = deck.process();
+            sum_sq += f64::from(l) * f64::from(l);
+        }
+        let rms = (sum_sq / 4_800.0).sqrt();
+        assert!(rms > 0.25, "a 1/32-beat loop buzzes quietly: rms {rms}");
+    }
+
+    #[test]
+    fn beat_jump_keeps_the_loop_length_at_a_track_bound() {
+        let track = make_track(SR, 12.0, Some(120.0), 0.0, sine(SR, 220.0, 0.3));
+        let mut deck = loaded(track);
+        seek_secs(&mut deck, 9.0);
+        deck.handle(DeckCmd::BeatLoop(4.0));
+        // The jump would carry the 2 s loop past the track end. It keeps its
+        // length and its label, and it still holds the playhead.
+        deck.handle(DeckCmd::BeatJump(4.0));
+        let s = deck.state();
+        let lp = s.loop_state.expect("loop kept");
+        assert!((lp.end_secs - lp.start_secs - 2.0).abs() < 1e-9, "{lp:?}");
+        assert_eq!(lp.beats, 4.0);
+        assert!((s.position_secs - 11.0).abs() < 1e-9);
+        assert!(lp.start_secs <= s.position_secs && s.position_secs < lp.end_secs);
+        // A jump back that fits moves the loop with the playhead.
+        deck.handle(DeckCmd::BeatJump(-8.0));
+        let lp = deck.state().loop_state.expect("loop kept");
+        assert!((lp.start_secs - 6.0).abs() < 1e-9);
+        assert!((lp.end_secs - 8.0).abs() < 1e-9);
+
+        // A loop already clamped at the track end keeps its (shorter) length.
+        seek_secs(&mut deck, 10.6);
+        deck.handle(DeckCmd::BeatLoop(4.0));
+        let lp = deck.state().loop_state.expect("loop");
+        assert!((lp.end_secs - 12.0).abs() < 1e-9);
+        deck.handle(DeckCmd::BeatJump(4.0));
+        let lp = deck.state().loop_state.expect("loop kept");
+        assert!((lp.end_secs - lp.start_secs - 1.5).abs() < 1e-9, "{lp:?}");
+        assert_eq!(lp.beats, 4.0);
     }
 }

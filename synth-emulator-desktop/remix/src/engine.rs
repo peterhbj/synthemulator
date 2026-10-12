@@ -54,7 +54,8 @@ pub enum RemixCmd {
     /// -1..=1 on the master bus.
     SetMasterFilter(f32),
     /// Echo send 0..=1, feedback 0..=0.95, time in beats of the master deck
-    /// (120 BPM without tempo).
+    /// (120 BPM for a master deck without tempo). While no deck plays, the
+    /// last master tempo is held, so an echo tail keeps its time.
     SetEcho {
         mix: f32,
         feedback: f32,
@@ -105,6 +106,9 @@ const CROSSFADE_SMOOTH_SECS: f32 = 0.005;
 const MASTER_SMOOTH_SECS: f32 = 0.020;
 /// Peak meters fall by 1/e in this many seconds.
 const METER_DECAY_SECS: f32 = 0.3;
+/// A peak meter below this (-120 dBFS) reads as silence and is set to 0. Left
+/// alone it would decay into the subnormal range, where every multiply is slow.
+const METER_FLOOR: f32 = 1e-6;
 /// Longest echo delay the buffer holds, and the shortest the engine asks for.
 const ECHO_MAX_SECS: f32 = 4.0;
 const ECHO_MIN_SECS: f32 = 0.01;
@@ -233,6 +237,9 @@ pub struct RemixEngine {
     echo_beats: f32,
     /// Delay currently set on `echo`, seconds.
     echo_secs: f32,
+    /// Tempo the echo follows: the master deck's, or 120 when it has none.
+    /// Held while no deck plays, so an echo-out tail keeps its time.
+    echo_bpm: f64,
     echo_countdown: u32,
     /// Its target is the user master gain.
     master_gain: Smoother,
@@ -271,6 +278,7 @@ impl RemixEngine {
             echo_feedback: ECHO_DEFAULT_FEEDBACK,
             echo_beats: ECHO_DEFAULT_BEATS,
             echo_secs,
+            echo_bpm: FALLBACK_BPM,
             echo_countdown: 0,
             master_gain: Smoother::new(fs, MASTER_SMOOTH_SECS, 1.0),
             limiter: Limiter::new(fs),
@@ -398,7 +406,8 @@ impl RemixEngine {
             let (l, r) = ch.filter.process(l, r);
             let gain = ch.fader.next() * ch.crossfade.next();
             let (l, r) = (l * gain, r * gain);
-            ch.level = (ch.level * decay).max(l.abs()).max(r.abs());
+            let level = (ch.level * decay).max(l.abs()).max(r.abs());
+            ch.level = if level < METER_FLOOR { 0.0 } else { level };
             bus_l += l;
             bus_r += r;
         }
@@ -407,7 +416,12 @@ impl RemixEngine {
         let (l, r) = self.echo.process(l, r);
         let master = self.master_gain.next();
         let (l, r) = self.limiter.process(l * master, r * master);
-        self.master_level = (self.master_level * decay).max(l.abs()).max(r.abs());
+        let master_level = (self.master_level * decay).max(l.abs()).max(r.abs());
+        self.master_level = if master_level < METER_FLOOR {
+            0.0
+        } else {
+            master_level
+        };
         (l, r)
     }
 
@@ -469,14 +483,17 @@ impl RemixEngine {
         self.crossfade_dirty = false;
     }
 
-    /// Retune the echo to the master deck's tempo, if the time moved.
+    /// Retune the echo to the master deck's tempo, if the time moved. With no
+    /// master deck (nothing playing) the last tempo is held.
     fn update_echo_time(&mut self) {
-        let bpm = self
-            .master_deck()
-            .and_then(|d| self.channels[d].deck.effective_bpm())
-            .filter(|b| b.is_finite() && *b > 0.0)
-            .unwrap_or(FALLBACK_BPM);
-        let secs = echo_time_secs(self.echo_beats, bpm);
+        if let Some(d) = self.master_deck() {
+            self.echo_bpm = self.channels[d]
+                .deck
+                .effective_bpm()
+                .filter(|b| b.is_finite() && *b > 0.0)
+                .unwrap_or(FALLBACK_BPM);
+        }
+        let secs = echo_time_secs(self.echo_beats, self.echo_bpm);
         if (secs - self.echo_secs).abs() > ECHO_RETUNE_SECS {
             self.echo_secs = secs;
             self.echo.set_time_secs(secs);
@@ -524,11 +541,13 @@ impl RemixEngine {
             .filter(|b| b.is_finite() && *b > 0.0);
         let to_has_tempo = self.channels[to].deck.state().base_bpm.is_some();
         if !self.channels[to].deck.is_playing() {
+            // Play first: an ended deck returns to its cue. Syncing first would
+            // clear `ended` and leave the deck parked at the end of the track.
+            self.channels[to].deck.handle(DeckCmd::Play);
             if let (Some(bpm), true) = (from_bpm, to_has_tempo) {
                 let phase = self.phase_of(from);
                 self.channels[to].deck.handle(DeckCmd::Sync { bpm, phase });
             }
-            self.channels[to].deck.handle(DeckCmd::Play);
         }
 
         let secs = match from_bpm {
@@ -1416,5 +1435,168 @@ mod tests {
             }
             assert_state_finite(&eng.state());
         }
+    }
+
+    /// Beat phases differ by less than `tol`, allowing for the wrap at 1.
+    fn phases_match(a: f64, b: f64, tol: f64) -> bool {
+        let d = (a - b).rem_euclid(1.0);
+        d.min(1.0 - d) < tol
+    }
+
+    #[test]
+    fn auto_transition_back_to_an_ended_deck_with_tempo_is_heard() {
+        let mut eng = RemixEngine::new(SR as f32);
+        // Deck A: a 2 s tone at 120 BPM, played out to its end.
+        load_play(&mut eng, 0, track(2.0, Some(120.0), sine(1000.0, 0.5)));
+        render(&mut eng, 2 * SR as usize + 1_000);
+        assert!(eng.state().decks[0].ended);
+        // Deck B: 123 BPM, the only deck heard.
+        load_play(&mut eng, 1, track(12.0, Some(123.0), sine(660.0, 0.5)));
+        eng.handle(RemixCmd::SetCrossfader(1.0));
+        render(&mut eng, SR as usize / 4);
+
+        eng.handle(RemixCmd::AutoTransition {
+            to: 0,
+            beats: 1.0,
+            fallback_secs: 4.0,
+        });
+        let out = render(&mut eng, SR as usize * 3 / 4);
+        let s = eng.state();
+        assert!(
+            s.decks[0].playing && !s.decks[0].ended,
+            "deck A ran out again at {} s",
+            s.decks[0].position_secs
+        );
+        // The transition is over by 0.49 s. Deck A now runs at 123/120, so its
+        // 1 kHz tone is heard at 1025 Hz. 11 520 frames hold a whole 246 cycles.
+        let heard = amp_at(&out[out.len() - 11_520..], 1025.0);
+        assert!(
+            heard > 0.2,
+            "deck A is silent after the transition: {heard}"
+        );
+    }
+
+    #[test]
+    fn sync_then_play_on_an_ended_deck_starts_near_its_cue_and_keeps_playing() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(1.0, Some(120.0), sine(1000.0, 0.5)));
+        render(&mut eng, SR as usize + 1_000);
+        assert!(eng.state().decks[0].ended);
+        load_play(&mut eng, 1, track(12.0, Some(123.0), sine(660.0, 0.5)));
+        render(&mut eng, SR as usize / 4 + 333);
+
+        eng.handle(RemixCmd::SyncDeck(0));
+        let s = eng.state();
+        assert!(!s.decks[0].ended, "sync must not leave deck A ended");
+        // Within half a beat of the cue, and on the other deck's phase.
+        assert!(
+            s.decks[0].position_secs < 0.5,
+            "{}",
+            s.decks[0].position_secs
+        );
+        let (a, b) = (
+            s.decks[0].beat_phase.unwrap(),
+            s.decks[1].beat_phase.unwrap(),
+        );
+        assert!(phases_match(a, b, 0.01), "phase {a} vs {b}");
+
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Play));
+        render(&mut eng, SR as usize / 4);
+        let s = eng.state();
+        assert!(s.decks[0].playing && !s.decks[0].ended);
+        assert!(
+            s.decks[0].position_secs < 0.75,
+            "{}",
+            s.decks[0].position_secs
+        );
+    }
+
+    #[test]
+    fn auto_transition_phase_matches_when_the_incoming_deck_is_at_its_start() {
+        let mut eng = RemixEngine::new(SR as f32);
+        // Both decks at 120 BPM with the first beat at 0 s.
+        load_play(&mut eng, 0, track(12.0, Some(120.0), sine(440.0, 0.5)));
+        eng.handle(RemixCmd::Deck(
+            1,
+            DeckCmd::Load(track(12.0, Some(120.0), sine(660.0, 0.5))),
+        ));
+        // Deck A is 0.3 s in, at beat phase 0.6. Deck B starts at phase 0 and
+        // must move back 0.4 beats; that wraps forward instead of clamping at 0.
+        render(&mut eng, SR as usize * 3 / 10);
+        eng.handle(RemixCmd::AutoTransition {
+            to: 1,
+            beats: 8.0,
+            fallback_secs: 1.0,
+        });
+        let s = eng.state();
+        let a = s.decks[0].beat_phase.unwrap();
+        let b = s.decks[1].beat_phase.unwrap();
+        assert!((a - 0.6).abs() < 0.01, "deck A phase {a}");
+        assert!((b - a).abs() < 0.01, "deck B phase {b} vs deck A {a}");
+    }
+
+    #[test]
+    fn echo_time_holds_the_master_tempo_while_nothing_plays() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(4.0, Some(174.0), sine(440.0, 0.1)));
+        eng.handle(RemixCmd::SetEcho {
+            mix: 1.0,
+            feedback: 0.7,
+            beats: 0.75,
+        });
+        let at_174 = 0.75 * 60.0 / 174.0;
+        render(&mut eng, 128);
+        assert!(
+            (eng.echo_secs - at_174 as f32).abs() < 1e-4,
+            "{}",
+            eng.echo_secs
+        );
+
+        // Pause, play again, then CUE (which pauses): the echo time never moves.
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Pause));
+        render(&mut eng, 128);
+        assert!(
+            (eng.echo_secs - at_174 as f32).abs() < 1e-4,
+            "pause: {}",
+            eng.echo_secs
+        );
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Play));
+        render(&mut eng, 128);
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Cue));
+        render(&mut eng, 128);
+        assert!(
+            (eng.echo_secs - at_174 as f32).abs() < 1e-4,
+            "cue: {}",
+            eng.echo_secs
+        );
+
+        // A playing deck without tempo is the master: the echo uses 120 BPM.
+        eng.handle(RemixCmd::Deck(
+            1,
+            DeckCmd::Load(track(4.0, None, sine(330.0, 0.1))),
+        ));
+        eng.handle(RemixCmd::Deck(1, DeckCmd::Play));
+        render(&mut eng, 128);
+        assert!((eng.echo_secs - 0.375).abs() < 1e-6, "{}", eng.echo_secs);
+    }
+
+    #[test]
+    fn meter_decay_never_reaches_the_subnormal_range() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(3.0, Some(120.0), sine(440.0, 0.5)));
+        render(&mut eng, SR as usize);
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Pause));
+        // Six seconds of silence: left alone, the meters would sink through the
+        // subnormal range on the way to 0.
+        for _ in 0..60 {
+            render(&mut eng, SR as usize / 10);
+            let s = eng.state();
+            for v in s.levels.iter().copied().chain([s.master_level]) {
+                assert!(!v.is_subnormal(), "meter value {v:e}");
+            }
+        }
+        let s = eng.state();
+        assert_eq!(s.levels, [0.0; DECKS]);
+        assert_eq!(s.master_level, 0.0);
     }
 }
