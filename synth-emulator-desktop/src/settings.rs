@@ -60,24 +60,51 @@ impl Default for XySettings {
     }
 }
 
+/// Hot cues the first builds knew about. They stay in `hot_cues` on disk, so
+/// older builds still read the file; the extra slots go in `more_cues`, which
+/// older builds ignore.
+const LEGACY_CUES: usize = 4;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(from = "MemoFile", into = "MemoFile")]
 pub struct TrackMemo {
-    #[serde(deserialize_with = "de_hot_cues")]
     pub hot_cues: [Option<f64>; remix::HOT_CUES],
     /// Manual / tapped tempo that replaces the detected one.
     pub bpm: Option<f64>,
 }
 
-/// Saved files may hold fewer slots (four before the extra ones). Missing
-/// slots stay empty, instead of the whole memo failing to load.
-fn de_hot_cues<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[Option<f64>; remix::HOT_CUES], D::Error> {
-    let saved = Vec::<Option<f64>>::deserialize(d)?;
-    let mut cues = [None; remix::HOT_CUES];
-    for (slot, cue) in cues.iter_mut().zip(saved) {
-        *slot = cue;
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct MemoFile {
+    bpm: Option<f64>,
+    hot_cues: [Option<f64>; LEGACY_CUES],
+    more_cues: [Option<f64>; remix::HOT_CUES - LEGACY_CUES],
+}
+
+impl From<MemoFile> for TrackMemo {
+    fn from(f: MemoFile) -> Self {
+        let mut hot_cues = [None; remix::HOT_CUES];
+        hot_cues[..LEGACY_CUES].copy_from_slice(&f.hot_cues);
+        hot_cues[LEGACY_CUES..].copy_from_slice(&f.more_cues);
+        Self {
+            hot_cues,
+            bpm: f.bpm,
+        }
     }
-    Ok(cues)
+}
+
+impl From<TrackMemo> for MemoFile {
+    fn from(m: TrackMemo) -> Self {
+        let mut hot_cues = [None; LEGACY_CUES];
+        hot_cues.copy_from_slice(&m.hot_cues[..LEGACY_CUES]);
+        let mut more_cues = [None; remix::HOT_CUES - LEGACY_CUES];
+        more_cues.copy_from_slice(&m.hot_cues[LEGACY_CUES..]);
+        Self {
+            bpm: m.bpm,
+            hot_cues,
+            more_cues,
+        }
+    }
 }
 
 impl TrackMemo {
@@ -230,6 +257,20 @@ mod tests {
         assert_eq!(memo.hot_cues[0], Some(1.5));
         assert_eq!(memo.hot_cues[2], Some(3.0));
         assert!(memo.hot_cues[4..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn memo_keeps_all_hot_cues_and_stays_readable_by_four_slot_builds() {
+        let mut memo = TrackMemo::default();
+        memo.hot_cues[1] = Some(2.0);
+        memo.hot_cues[5] = Some(9.5);
+        let json = serde_json::to_string(&memo).unwrap();
+        let back: TrackMemo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, memo);
+        // What an older build reads: `hot_cues` with four entries, and the
+        // unknown `more_cues` key ignored.
+        let legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy["hot_cues"].as_array().unwrap().len(), 4);
     }
 
     #[test]
