@@ -538,7 +538,9 @@ impl RemixEngine {
             return;
         }
         let other = 1 - deck;
-        let Some(bpm) = self.channels[other].deck.effective_bpm() else {
+        // The tempo without the held nudge: a nudge is a momentary change and
+        // must not be recorded in the link.
+        let Some(bpm) = self.channels[other].deck.tempo_bpm() else {
             return;
         };
         if self.channels[deck].deck.tempo_bpm().is_none() {
@@ -613,12 +615,17 @@ impl RemixEngine {
             .deck
             .effective_bpm()
             .filter(|b| b.is_finite() && *b > 0.0);
+        // The sync target is the tempo without the nudge (see `sync_deck`).
+        let from_tempo = self.channels[from]
+            .deck
+            .tempo_bpm()
+            .filter(|b| b.is_finite() && *b > 0.0);
         let to_has_tempo = self.channels[to].deck.state().base_bpm.is_some();
         if !self.channels[to].deck.is_playing() {
             // Play first: an ended deck returns to its cue. Syncing first would
             // clear `ended` and leave the deck parked at the end of the track.
             self.channels[to].deck.handle(DeckCmd::Play);
-            if let (Some(bpm), true) = (from_bpm, to_has_tempo) {
+            if let (Some(bpm), true) = (from_tempo, to_has_tempo) {
                 let phase = self.phase_of(from);
                 self.channels[to].deck.handle(DeckCmd::Sync { bpm, phase });
                 self.linked = true;
@@ -651,6 +658,8 @@ impl RemixEngine {
         if let Some(t) = self.transition.take() {
             self.channels[t.to].set_bass(1.0);
             self.channels[t.from].set_bass(1.0);
+            // The link a transition set up ends with it.
+            self.linked = false;
         }
     }
 
@@ -662,6 +671,7 @@ impl RemixEngine {
         t.elapsed += 1.0;
         if t.elapsed >= t.total {
             self.transition = None;
+            self.linked = false;
             self.crossfader = t.end;
             self.channels[t.to].set_bass(1.0);
             self.channels[t.from].set_bass(1.0);
@@ -1291,6 +1301,40 @@ mod tests {
         assert_eq!(eng.state().decks[1].speed, before);
         eng.handle(RemixCmd::SyncDeck(0));
         assert_eq!(eng.state().decks[0].speed, 1.0);
+    }
+
+    #[test]
+    fn sync_ignores_a_held_nudge_on_the_other_deck() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(3.0, Some(120.0), sine(440.0, 0.5)));
+        load_play(&mut eng, 1, track(3.0, Some(126.0), sine(660.0, 0.5)));
+        // Nudge deck 0 up while syncing deck 1 to it.
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Nudge(1.0)));
+        eng.handle(RemixCmd::SyncDeck(1));
+        eng.handle(RemixCmd::Deck(0, DeckCmd::Nudge(0.0)));
+        let lead = eng.channels[0].deck.tempo_bpm().unwrap();
+        let follow = eng.channels[1].deck.tempo_bpm().unwrap();
+        assert!((lead - 120.0).abs() < 1e-9, "lead tempo {lead}");
+        assert!((follow - 120.0).abs() < 1e-9, "follower tempo {follow}");
+        assert!(eng.state().synced);
+    }
+
+    #[test]
+    fn a_finished_transition_ends_the_link() {
+        let mut eng = RemixEngine::new(SR as f32);
+        load_play(&mut eng, 0, track(6.0, Some(120.0), sine(440.0, 0.5)));
+        eng.handle(RemixCmd::Deck(1, DeckCmd::Load(track(6.0, Some(124.0), sine(660.0, 0.5)))));
+        eng.handle(RemixCmd::SetCrossfader(0.0));
+        eng.handle(RemixCmd::AutoTransition { to: 1, beats: 4.0, fallback_secs: 1.0 });
+        assert!(eng.state().synced, "the transition links the decks");
+        assert!(eng.state().auto.is_some());
+        render(&mut eng, 4 * SR as usize);
+        assert!(eng.state().auto.is_none(), "transition finished");
+        assert!(!eng.state().synced, "link ends with the transition");
+        // Steps no longer move the outgoing deck.
+        let before = eng.state().decks[0].speed;
+        eng.handle(RemixCmd::StepBpm(1.0));
+        assert_eq!(eng.state().decks[0].speed, before);
     }
 
     #[test]
