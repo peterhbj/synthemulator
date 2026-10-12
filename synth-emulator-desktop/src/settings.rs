@@ -73,19 +73,35 @@ pub struct TrackMemo {
     pub bpm: Option<f64>,
 }
 
+/// On-disk shape of a memo. Lengths and nulls are not trusted: a short,
+/// long or null list loads what it can, so one odd field cannot make the
+/// whole settings file fail and reset.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct MemoFile {
     bpm: Option<f64>,
-    hot_cues: [Option<f64>; LEGACY_CUES],
-    more_cues: [Option<f64>; remix::HOT_CUES - LEGACY_CUES],
+    hot_cues: Option<Vec<Option<f64>>>,
+    more_cues: Option<Vec<Option<f64>>>,
 }
+
+const _: () = assert!(remix::HOT_CUES >= LEGACY_CUES);
 
 impl From<MemoFile> for TrackMemo {
     fn from(f: MemoFile) -> Self {
+        let hot = f.hot_cues.unwrap_or_default();
+        let more = f.more_cues.unwrap_or_default();
         let mut hot_cues = [None; remix::HOT_CUES];
-        hot_cues[..LEGACY_CUES].copy_from_slice(&f.hot_cues);
-        hot_cues[LEGACY_CUES..].copy_from_slice(&f.more_cues);
+        for (slot, cue) in hot_cues.iter_mut().zip(hot.iter()) {
+            *slot = *cue;
+        }
+        // Slots past the legacy list come from `more_cues`, unless a file
+        // already carries them in `hot_cues`. Extra entries are ignored.
+        for (i, cue) in more.into_iter().enumerate() {
+            let index = LEGACY_CUES + i;
+            if index < remix::HOT_CUES && index >= hot.len() {
+                hot_cues[index] = cue;
+            }
+        }
         Self {
             hot_cues,
             bpm: f.bpm,
@@ -95,14 +111,10 @@ impl From<MemoFile> for TrackMemo {
 
 impl From<TrackMemo> for MemoFile {
     fn from(m: TrackMemo) -> Self {
-        let mut hot_cues = [None; LEGACY_CUES];
-        hot_cues.copy_from_slice(&m.hot_cues[..LEGACY_CUES]);
-        let mut more_cues = [None; remix::HOT_CUES - LEGACY_CUES];
-        more_cues.copy_from_slice(&m.hot_cues[LEGACY_CUES..]);
         Self {
             bpm: m.bpm,
-            hot_cues,
-            more_cues,
+            hot_cues: Some(m.hot_cues[..LEGACY_CUES].to_vec()),
+            more_cues: Some(m.hot_cues[LEGACY_CUES..].to_vec()),
         }
     }
 }
@@ -290,6 +302,42 @@ mod tests {
         let old: Build88ea342Memo = serde_json::from_str(&json).expect("old build reads the file");
         assert_eq!(old.hot_cues[0], Some(1.0));
         assert_eq!(old.bpm, Some(126.0));
+    }
+
+    #[test]
+    fn odd_hot_cue_lists_load_what_they_can() {
+        let memo = |json: &str| -> TrackMemo {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"))
+        };
+        // more_cues of 0, 1, 3 entries, null, and absent: no failure, bpm kept.
+        for more in ["[]", "[3.0]", "[3.0, 4.0, 5.0]", "null"] {
+            let m = memo(&format!(r#"{{"bpm": 124.0, "hot_cues": [1.0, null, 2.0, null], "more_cues": {more}}}"#));
+            assert_eq!(m.bpm, Some(124.0), "more_cues {more}");
+            assert_eq!(m.hot_cues[0], Some(1.0));
+            assert_eq!(m.hot_cues[2], Some(2.0));
+        }
+        let m = memo(r#"{"bpm": 124.0, "hot_cues": [1.0, null, 2.0, null, null]}"#);
+        assert_eq!(m.bpm, Some(124.0), "short hot_cues, no more_cues");
+        assert!(m.hot_cues[4..].iter().all(Option::is_none));
+
+        // more_cues fill slots 4 and 5 and ignore the excess.
+        let m = memo(r#"{"hot_cues": [null, null, null, null], "more_cues": [6.0, 7.0, 8.0]}"#);
+        assert_eq!(m.hot_cues[4], Some(6.0));
+        assert_eq!(m.hot_cues[5], Some(7.0));
+
+        // hot_cues with six entries (written by 214ff4f and 480cbe8): all six
+        // load, and more_cues does not overwrite them.
+        let m = memo(r#"{"hot_cues": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "more_cues": [9.0, 9.0]}"#);
+        assert_eq!(m.hot_cues[4], Some(5.0));
+        assert_eq!(m.hot_cues[5], Some(6.0));
+
+        // hot_cues with two entries, and a null hot_cues.
+        let m = memo(r#"{"hot_cues": [1.0, 2.0], "more_cues": [3.0, 4.0]}"#);
+        assert_eq!(m.hot_cues[1], Some(2.0));
+        assert_eq!(m.hot_cues[2], None, "not taken from more_cues: hot_cues had two entries");
+        let m = memo(r#"{"bpm": 99.0, "hot_cues": null}"#);
+        assert_eq!(m.bpm, Some(99.0));
+        assert!(m.hot_cues.iter().all(Option::is_none));
     }
 
     #[test]
