@@ -53,7 +53,7 @@ impl AudioHost {
             .map_err(|e| format!("output config: {e}"))?;
 
         let mut config: StreamConfig = supported.config();
-        config.buffer_size = BufferSize::Fixed(OUTPUT_FRAMES);
+        config.buffer_size = BufferSize::Fixed(output_frames());
 
         let sample_rate = config.sample_rate.0 as f32;
         let channels = config.channels as usize;
@@ -189,7 +189,8 @@ fn build_stream<T>(
 where
     T: cpal::SizedSample + cpal::FromSample<f32>,
 {
-    let err_fn = |e| crate::log::warn(&format!("audio: {e}"));
+    static AUDIO_ERR: crate::log::Throttle = crate::log::Throttle::new();
+    let err_fn = |e| AUDIO_ERR.warn(&format!("audio: {e}"));
 
     let make = |cfg: &StreamConfig| {
         let rx = rx.clone();
@@ -280,6 +281,16 @@ const QUANTUM_FRAMES: u32 = 256;
 /// command the UI sends; 256 underran constantly; 512 is the first stable size.
 const OUTPUT_FRAMES: u32 = 512;
 
+/// Buffer size to ask for: `HELIX_OUTPUT_FRAMES` if set to a positive number,
+/// otherwise [`OUTPUT_FRAMES`]. Lower is less latency but more underruns.
+fn output_frames() -> u32 {
+    std::env::var("HELIX_OUTPUT_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|f| *f > 0)
+        .unwrap_or(OUTPUT_FRAMES)
+}
+
 /// Ask PipeWire for a live-guitar quantum before ALSA streams open.
 pub(crate) fn request_pipewire_latency() {
     if std::env::var_os("PIPEWIRE_LATENCY").is_none() {
@@ -291,7 +302,7 @@ pub(crate) fn open_low_latency<S, E>(
     mut config: StreamConfig,
     mut make: impl FnMut(&StreamConfig) -> Result<S, E>,
 ) -> Result<S, E> {
-    for frames in [OUTPUT_FRAMES, 1024] {
+    for frames in [output_frames(), 1024] {
         config.buffer_size = BufferSize::Fixed(frames);
         if let Ok(stream) = make(&config) {
             return Ok(stream);

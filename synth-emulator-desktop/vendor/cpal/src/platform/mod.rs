@@ -752,6 +752,7 @@ mod platform_impl {
 // TODO: Remove these in favour of using negative trait bounds if they stabilise.
 
 // A marker used to remove the `Send` and `Sync` traits.
+#[allow(dead_code)]
 struct NotSendSyncAcrossAllPlatforms(std::marker::PhantomData<*mut ()>);
 
 impl Default for NotSendSyncAcrossAllPlatforms {

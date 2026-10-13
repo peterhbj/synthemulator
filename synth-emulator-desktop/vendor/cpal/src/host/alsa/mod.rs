@@ -604,8 +604,8 @@ fn input_stream_worker(
                 continue;
             }
             PollDescriptorsFlow::XRun => {
-                if let Err(err) = stream.channel.prepare() {
-                    error_callback(err.into());
+                if recover_pcm(&stream.channel, true, error_callback) == Recovery::Gone {
+                    return;
                 }
                 continue;
             }
@@ -655,8 +655,8 @@ fn output_stream_worker(
         match flow {
             PollDescriptorsFlow::Continue => continue,
             PollDescriptorsFlow::XRun => {
-                if let Err(err) = stream.channel.prepare() {
-                    error_callback(err.into());
+                if recover_pcm(&stream.channel, false, error_callback) == Recovery::Gone {
+                    return;
                 }
                 continue;
             }
@@ -706,6 +706,58 @@ fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: SampleRat
 
 #[cfg(not(feature = "audio_thread_priority"))]
 fn boost_current_thread_priority(_: BufferSize, _: SampleRate) {}
+
+/// Outcome of bringing a PCM back after an xrun, suspend or error.
+#[derive(Debug, PartialEq, Eq)]
+enum Recovery {
+    /// Prepared or running again; the next poll decides what happens.
+    Ok,
+    /// Recovery failed for now; the worker polls again.
+    Failed,
+    /// The device is gone; the worker stops.
+    Gone,
+}
+
+/// The errno to recover a PCM in `state` with, or `None` if it is unplugged.
+fn recovery_errno(state: alsa::pcm::State) -> Option<libc::c_int> {
+    match state {
+        alsa::pcm::State::Disconnected => None,
+        alsa::pcm::State::Suspended => Some(libc::ESTRPIPE),
+        _ => Some(libc::EPIPE),
+    }
+}
+
+/// Helix patch: recover from the PCM state. Upstream only ever called
+/// `prepare()`, which fails on a suspended or unplugged device and loops.
+/// Capture stays PREPARED after recovery, so it is started again here;
+/// playback starts itself at its start threshold.
+fn recover_pcm(
+    channel: &alsa::pcm::PCM,
+    is_input: bool,
+    error_callback: &mut (dyn FnMut(StreamError) + Send + 'static),
+) -> Recovery {
+    let Some(errno) = recovery_errno(channel.state()) else {
+        error_callback(StreamError::DeviceNotAvailable);
+        return Recovery::Gone;
+    };
+    if let Err(err) = channel.try_recover(alsa::Error::new("snd_pcm_recover", errno), true) {
+        // A device pulled out mid-recovery fails here. Report that once, not on every poll.
+        if channel.state() == alsa::pcm::State::Disconnected {
+            error_callback(StreamError::DeviceNotAvailable);
+            return Recovery::Gone;
+        }
+        error_callback(err.into());
+        std::thread::sleep(Duration::from_millis(10));
+        return Recovery::Failed;
+    }
+    if is_input {
+        if let Err(err) = channel.start() {
+            error_callback(err.into());
+            return Recovery::Failed;
+        }
+    }
+    Recovery::Ok
+}
 
 enum PollDescriptorsFlow {
     Continue,
@@ -1202,5 +1254,28 @@ impl From<alsa::Error> for StreamError {
     fn from(err: alsa::Error) -> Self {
         let err: BackendSpecificError = err.into();
         err.into()
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use alsa::pcm::State;
+
+    #[test]
+    fn xrun_and_errors_recover_with_epipe() {
+        assert_eq!(recovery_errno(State::XRun), Some(libc::EPIPE));
+        assert_eq!(recovery_errno(State::Prepared), Some(libc::EPIPE));
+        assert_eq!(recovery_errno(State::Running), Some(libc::EPIPE));
+    }
+
+    #[test]
+    fn suspended_resumes_with_estrpipe() {
+        assert_eq!(recovery_errno(State::Suspended), Some(libc::ESTRPIPE));
+    }
+
+    #[test]
+    fn disconnected_has_no_recovery() {
+        assert_eq!(recovery_errno(State::Disconnected), None);
     }
 }
