@@ -6,7 +6,7 @@ use std::f64::consts::{FRAC_1_SQRT_2, PI};
 /// `first_beat_secs + n * 60 / bpm` (n may be negative).
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Analysis {
-    /// Detected tempo; `None` when there is no confident pulse.
+    /// Detected tempo; `None` for silence or no pulse at all.
     pub bpm: Option<f64>,
     /// Grid anchor: time of a beat near the start of the music, in seconds.
     pub first_beat_secs: f64,
@@ -40,8 +40,13 @@ const ANALYSIS_WINDOW_START: f64 = 0.25;
 const ENVELOPE_RATE: f64 = 200.0;
 /// Whole-track RMS of the mono mixdown below this is silence.
 const SILENCE_RMS: f64 = 1e-4;
-/// Confidence below this reports no tempo.
-const MIN_CONFIDENCE: f64 = 0.25;
+/// Below this the pulse is too weak to report at all (noise, speech).
+/// Real music often scores low on this statistic and still gets the right
+/// tempo, so the bar is low and the UI flags anything under
+/// `TEMPO_UNSURE` instead of hiding it.
+const MIN_CONFIDENCE: f64 = 0.02;
+/// Below this confidence the UI marks the tempo as a guess.
+pub const TEMPO_UNSURE: f32 = 0.2;
 /// Phase offsets tried per candidate tempo in the coarse refinement.
 const PHASE_STEPS: usize = 32;
 /// The faster octave wins when its comb score reaches this share of the best.
@@ -67,8 +72,9 @@ const SNAP_SCORE_RATIO: f64 = 0.99;
 ///
 /// `samples` is interleaved stereo at `sample_rate`. Result tempo is folded
 /// into 70..=180 BPM (DJ convention: 140 not 70, 87 not 174 only if the
-/// pulse is genuinely half-time) and rounded to 0.01 BPM. Silence or
-/// arrhythmic material returns `bpm: None, confidence < 0.3`.
+/// pulse is genuinely half-time) and rounded to 0.01 BPM. Silence returns
+/// `bpm: None`; a weak pulse still returns a tempo, with its low
+/// `confidence` for the UI to flag.
 pub fn detect_tempo(samples: &[f32], sample_rate: u32) -> Analysis {
     let silent = Analysis {
         bpm: None,

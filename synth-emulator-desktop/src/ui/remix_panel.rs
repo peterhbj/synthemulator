@@ -9,8 +9,9 @@ use eframe::egui::{
 };
 use remix::{
     Band, CrossfaderCurve, DeckCmd, DeckState, RemixCmd, RemixState, TapTempo, Track, DECKS,
-    HOT_CUES, TEMPO_RANGES,
+    HOT_CUES, KEY_UNSURE, TEMPO_RANGES, TEMPO_UNSURE,
 };
+use remix::key::{key_at_speed, pitch_at_speed, speed_to_match, Key as MusicKey};
 
 use super::theme::{self, ACCENT, ACCENT_FG, BG, ELEVATED, FG, MUTED, SUBTLE, SURFACE};
 use super::widgets::{chip, knob};
@@ -35,6 +36,12 @@ const CUE_COLORS: [Color32; HOT_CUES] = [
     Color32::from_rgb(120, 220, 230),
 ];
 const LOOP_BEATS: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
+/// Key readout when it mixes with the other deck, and when it would but the
+/// two decks are detuned from each other.
+const KEY_MATCH: Color32 = Color32::from_rgb(90, 210, 130);
+const KEY_DETUNED: Color32 = Color32::from_rgb(250, 190, 70);
+/// Two decks further apart than this (after rounding to semitones) clash.
+const DETUNE_CENTS: f64 = 25.0;
 const AUTO_BEATS: [f32; 4] = [4.0, 8.0, 16.0, 32.0];
 /// Filter sweep speed while E/R or U/I is held (full range per second).
 const FILTER_SWEEP_PER_SEC: f32 = 0.9;
@@ -167,6 +174,52 @@ pub struct RemixUi {
     auto_running: bool,
     message: Option<(String, f64)>,
     last_time: f64,
+    /// Key each deck sounds in this frame, refreshed at the top of `show`.
+    sounding: [Option<Sounding>; DECKS],
+}
+
+/// The key a deck sounds in right now. There is no key lock, so the tempo
+/// fader moves the pitch with the speed.
+#[derive(Clone, Copy, Debug)]
+struct Sounding {
+    /// Detected key of the track at its original speed.
+    base: MusicKey,
+    tuning_cents: f64,
+    confidence: f32,
+    speed: f64,
+    /// `base` moved by the speed, rounded to the nearest semitone...
+    key: MusicKey,
+    /// ...and how far off that semitone it sounds.
+    cents: f64,
+    /// Fractional semitones above C, tuning and speed included.
+    pitch: f64,
+}
+
+impl Sounding {
+    fn of(track: Option<&Arc<Track>>, ds: &DeckState) -> Option<Self> {
+        let t = track.filter(|t| ds.loaded && t.id == ds.track_id)?;
+        let base = t.key.key?;
+        let speed = if ds.speed > 0.0 { ds.speed } else { 1.0 };
+        let (key, cents) = key_at_speed(base, t.key.tuning_cents, speed);
+        Some(Self {
+            base,
+            tuning_cents: t.key.tuning_cents,
+            confidence: t.key.confidence,
+            speed,
+            key,
+            cents,
+            pitch: pitch_at_speed(base, t.key.tuning_cents, speed),
+        })
+    }
+
+    /// Mixes with `other`: compatible keys and less than `DETUNE_CENTS`
+    /// apart. `None` when the keys clash, `Some(false)` when they are
+    /// compatible but detuned.
+    fn matches(&self, other: &Sounding) -> Option<bool> {
+        self.key
+            .is_compatible(other.key)
+            .then(|| (self.cents - other.cents).abs() < DETUNE_CENTS)
+    }
 }
 
 impl RemixUi {
@@ -193,6 +246,7 @@ impl RemixUi {
             auto_running: false,
             message: None,
             last_time: 0.0,
+            sounding: [None; DECKS],
         }
     }
 
@@ -268,9 +322,14 @@ impl RemixUi {
                         sink.send(RemixCmd::Deck(d, DeckCmd::SetHotCues(memo.hot_cues)));
                     }
                     let bpm = memo.bpm.or(track.analysis.bpm);
+                    let key = track
+                        .key
+                        .key
+                        .map(|k| format!(", {} {}", k.name(), k.camelot()))
+                        .unwrap_or_default();
                     self.say(
                         match bpm {
-                            Some(b) => format!("{} no deck {} ({b:.2} BPM)", track.title, DECK_NAMES[d]),
+                            Some(b) => format!("{} no deck {} ({b:.2} BPM{key})", track.title, DECK_NAMES[d]),
                             None => format!(
                                 "{} no deck {} (sem BPM detectado: use TAP)",
                                 track.title, DECK_NAMES[d]
@@ -582,11 +641,14 @@ impl RemixUi {
     ) -> bool {
         let mut settings_changed = false;
         for d in 0..DECKS {
+            self.sounding[d] = Sounding::of(self.decks[d].track.as_ref(), &state.decks[d]);
+        }
+        for d in 0..DECKS {
             self.zoom_waveform(ui, d, &state.decks[d], sink);
             ui.add_space(4.0);
         }
         ui.add_space(6.0);
-        tempo_row(ui, state, sink);
+        tempo_row(ui, state, &self.sounding, sink);
         ui.add_space(6.0);
 
         // Wide windows: deck A | mixer | deck B. Narrow ones (small laptop
@@ -874,8 +936,22 @@ impl RemixUi {
                 ui.horizontal(|ui| {
                     let bpm = ds.bpm.map(|b| format!("{b:.2}")).unwrap_or_else(|| "--.--".into());
                     ui.label(RichText::new(bpm).monospace().size(20.0).color(FG));
+                    let unsure_bpm = self.decks[d]
+                        .track
+                        .as_ref()
+                        .filter(|t| ds.loaded && t.id == ds.track_id && t.analysis.bpm.is_some())
+                        .is_some_and(|t| t.analysis.confidence < TEMPO_UNSURE && settings.memo(&t.path).bpm.is_none());
+                    if unsure_bpm {
+                        ui.label(RichText::new("?").size(14.0).color(KEY_DETUNED)).on_hover_text(
+                            "BPM incerto: confira com TAP ou arraste o BPM na lista para corrigir",
+                        );
+                    }
                     ui.label(RichText::new("BPM").size(10.5).color(SUBTLE));
                     ui.add_space(8.0);
+                    if let Some(s) = self.sounding[d] {
+                        key_readout(ui, &s, self.sounding[1 - d].as_ref());
+                        ui.add_space(8.0);
+                    }
                     // Speed is 0 until the audio thread has published a state.
                     let speed = if ds.speed > 0.0 { (ds.speed - 1.0) * 100.0 } else { 0.0 };
                     ui.label(RichText::new(format!("{speed:+.2}%")).monospace().size(12.0).color(MUTED));
@@ -1309,7 +1385,7 @@ impl RemixUi {
 
 /// Shared BPM readout with a +1 / −1 step. It moves the tempo deck, and both
 /// decks while a sync links them, so their beats stay locked.
-fn tempo_row(ui: &mut Ui, state: &RemixState, sink: &dyn RemixSink) {
+fn tempo_row(ui: &mut Ui, state: &RemixState, sounding: &[Option<Sounding>; DECKS], sink: &dyn RemixSink) {
     ui.horizontal(|ui| {
         ui.label(theme::section_label("BPM"));
         let bpm = state
@@ -1326,7 +1402,86 @@ fn tempo_row(ui: &mut Ui, state: &RemixState, sink: &dyn RemixSink) {
         if state.synced {
             ui.label(RichText::new("sincronizados").size(11.0).color(SUBTLE));
         }
+        key_match_row(ui, sounding, sink);
     });
+}
+
+/// Key the deck sounds in, Camelot code and detune, coloured by whether it
+/// mixes with the other deck.
+fn key_readout(ui: &mut Ui, s: &Sounding, other: Option<&Sounding>) {
+    let color = match other.and_then(|o| s.matches(o)) {
+        Some(true) => KEY_MATCH,
+        Some(false) => KEY_DETUNED,
+        None => FG,
+    };
+    let mut text = format!("{} {}", s.key.camelot(), s.key.name());
+    if s.cents.abs() >= 10.0 {
+        text.push_str(&format!(" {:+.0}¢", s.cents));
+    }
+    if s.confidence < KEY_UNSURE {
+        text.push('?');
+    }
+    let mut hover = format!(
+        "Tom original: {} ({}), afinação {:+.0}¢.",
+        s.base.name(),
+        s.base.camelot(),
+        s.tuning_cents
+    );
+    if (s.speed - 1.0).abs() > 1e-4 {
+        hover.push_str(&format!(
+            " Com o pitch em {:+.2}% soa em {} ({}).",
+            (s.speed - 1.0) * 100.0,
+            s.key.name(),
+            s.key.camelot()
+        ));
+    }
+    if s.confidence < KEY_UNSURE {
+        hover.push_str(" Tom incerto.");
+    }
+    if let Some(o) = other {
+        hover.push_str(match s.matches(o) {
+            Some(true) => " Combina com o outro deck.",
+            Some(false) => " Combina com o outro deck, mas os dois estão desafinados entre si.",
+            None => " Não combina com o outro deck.",
+        });
+    }
+    ui.label(RichText::new(text).monospace().size(13.0).color(color).strong())
+        .on_hover_text(hover);
+}
+
+/// Speed change that puts each deck in a key compatible with the other one
+/// (no key lock, so speeding up raises the key), as a button per deck.
+fn key_match_row(ui: &mut Ui, sounding: &[Option<Sounding>; DECKS], sink: &dyn RemixSink) {
+    let (Some(a), Some(b)) = (sounding[0], sounding[1]) else {
+        return;
+    };
+    ui.add_space(12.0);
+    ui.label(theme::section_label("TOM"));
+    if a.matches(&b) == Some(true) {
+        ui.label(RichText::new("combinam").size(11.0).color(KEY_MATCH));
+        return;
+    }
+    for (d, (from, to)) in [(b, a), (a, b)].iter().enumerate().map(|(i, p)| (1 - i, p)) {
+        let Some((speed, want)) = speed_to_match(from.base, from.tuning_cents, from.speed, to.key, to.pitch) else {
+            continue;
+        };
+        let max = TEMPO_RANGES[TEMPO_RANGES.len() - 1] as f64;
+        if (speed - 1.0).abs() > max {
+            continue;
+        }
+        let pct = (speed / from.speed - 1.0) * 100.0;
+        let label = format!("{}→{} {pct:+.1}%", DECK_NAMES[d], want.camelot());
+        let hover = format!(
+            "Muda o pitch do deck {} em {pct:+.1}% para soar em {} ({}), que combina com o deck {}. O BPM muda junto.",
+            DECK_NAMES[d],
+            want.name(),
+            want.camelot(),
+            DECK_NAMES[1 - d]
+        );
+        if chip(ui, &label, false).on_hover_text(hover).clicked() {
+            sink.send(RemixCmd::Deck(d, DeckCmd::SetTempoSpeed(speed)));
+        }
+    }
 }
 
 struct DeckKeys {

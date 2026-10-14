@@ -10,10 +10,12 @@ pub mod decode;
 pub mod deck;
 pub mod dsp;
 pub mod engine;
+pub mod key;
 pub mod track;
 
-pub use analysis::{build_overview, detect_tempo, Analysis, Overview, OverviewBin, TapTempo};
+pub use analysis::{build_overview, detect_tempo, Analysis, Overview, OverviewBin, TapTempo, TEMPO_UNSURE};
 pub use decode::{decode_file, is_supported, load_track, resample_stereo, LoadError, SUPPORTED_EXTENSIONS};
+pub use key::{detect_key, Key, KeyAnalysis, KEY_UNSURE};
 pub use deck::{Deck, DeckCmd, DeckState, LoopState, HOT_CUES, TEMPO_RANGES};
 pub use dsp::{Band, CrossfaderCurve};
 pub use engine::{RemixCmd, RemixEngine, RemixState, DECKS};

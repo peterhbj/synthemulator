@@ -11,3 +11,4 @@ name = "remix"
 [dependencies]
 symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "flac", "wav", "pcm", "adpcm", "vorbis", "ogg", "aac", "isomp4", "alac", "aiff"] }
 rubato = "0.16"
+realfft = "3.5"

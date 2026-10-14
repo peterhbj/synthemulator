@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::analysis::{Analysis, Overview};
+use crate::key::KeyAnalysis;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -17,6 +18,8 @@ pub struct Track {
     /// Interleaved stereo `L, R, L, R, ...` at `sample_rate`.
     pub samples: Vec<f32>,
     pub analysis: Analysis,
+    /// Detected key; the default (no key) until `load_track` fills it in.
+    pub key: KeyAnalysis,
     pub overview: Overview,
 }
 
@@ -36,6 +39,7 @@ impl Track {
             sample_rate,
             samples,
             analysis,
+            key: KeyAnalysis::default(),
             overview,
         }
     }

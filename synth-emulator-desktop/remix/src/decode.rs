@@ -13,6 +13,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 use crate::analysis::{build_overview, detect_tempo, OVERVIEW_BINS_PER_SEC};
+use crate::key::detect_key;
 use crate::track::Track;
 
 /// Front-centre weight when a source has three or more channels (-3 dB, ~0.7071).
@@ -399,7 +400,7 @@ fn valid_rate(rate: u32) -> bool {
     (MIN_RATE..=MAX_RATE).contains(&rate)
 }
 
-/// Decode, resample to `target_rate`, detect tempo and build the overview.
+/// Decode, resample to `target_rate`, detect tempo and key and build the overview.
 /// Runs on a loader thread, never on the audio thread.
 pub fn load_track(path: &Path, target_rate: u32) -> Result<Track, LoadError> {
     let (raw, rate) = decode_file(path)?;
@@ -415,14 +416,17 @@ pub fn load_track(path: &Path, target_rate: u32) -> Result<Track, LoadError> {
         .and_then(|s| s.to_str())
         .unwrap_or("sem nome")
         .to_string();
-    Ok(Track::new(
+    let key = detect_key(&samples, target_rate);
+    let mut track = Track::new(
         title,
         path.to_path_buf(),
         target_rate,
         samples,
         analysis,
         overview,
-    ))
+    );
+    track.key = key;
+    Ok(track)
 }
 
 #[cfg(test)]
