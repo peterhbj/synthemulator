@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::track::Track;
 
-pub const HOT_CUES: usize = 4;
+pub const HOT_CUES: usize = 6;
 /// Tempo fader ranges (fraction): ±8 %, ±16 %, ±50 %.
 pub const TEMPO_RANGES: [f32; 3] = [0.08, 0.16, 0.50];
 /// Speed change while a nudge key is held.
@@ -52,6 +52,9 @@ pub enum DeckCmd {
     LoopDouble,
     /// Tempo fader -1..=1; speed = 1 + fader * range.
     SetTempoFader(f32),
+    /// Tempo speed (1.0 = original), clamped to the widest range. Picks the
+    /// range that fits, like a sync does.
+    SetTempoSpeed(f64),
     /// One of `TEMPO_RANGES`; keeps the current speed when possible.
     SetTempoRange(f32),
     /// Held nudge: -1, 0 or +1. Multiplies speed by 1 ± NUDGE_AMOUNT.
@@ -234,6 +237,12 @@ impl Deck {
                 }
             }
             DeckCmd::SetTempoRange(range) => self.set_tempo_range(range),
+            DeckCmd::SetTempoSpeed(speed) => {
+                if speed.is_finite() {
+                    let widest = RANGES_F64[RANGES_F64.len() - 1];
+                    self.fit_tempo(speed.clamp(1.0 - widest, 1.0 + widest));
+                }
+            }
             DeckCmd::Nudge(dir) => {
                 self.nudge = if dir > 0.0 {
                     1.0
@@ -375,6 +384,11 @@ impl Deck {
     pub fn beat_phase(&self) -> Option<f64> {
         self.beat_phase_at(self.pos_secs())
     }
+
+    /// `base_bpm * tempo speed`: the tempo without a held nudge.
+    pub fn tempo_bpm(&self) -> Option<f64> {
+        self.base_bpm().map(|b| b * self.tempo_speed())
+    }
 }
 
 /// Sample rate of a track, guarded against zero.
@@ -438,7 +452,7 @@ impl Deck {
     }
 
     /// Tempo part of the speed: `1 + fader * range`.
-    fn tempo_speed(&self) -> f64 {
+    pub fn tempo_speed(&self) -> f64 {
         1.0 + self.tempo_fader * self.tempo_range
     }
 
@@ -1117,7 +1131,14 @@ mod tests {
         let track = make_track(SR, 3.0, None, 0.0, sine(SR, 100.0, 0.5));
         let sine_step = max_step(&track);
         let mut deck = loaded(track);
-        deck.handle(DeckCmd::SetHotCues([Some(0.61234), None, None, None]));
+        deck.handle(DeckCmd::SetHotCues([
+            Some(0.61234),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]));
         deck.handle(DeckCmd::Play);
         run(&mut deck, SR as usize);
         let mut out = Vec::new();
@@ -1201,16 +1222,16 @@ mod tests {
                 Some(p.value())
             }
         };
-        match p.pick(25) {
+        match p.pick(26) {
             0 if allow_load => DeckCmd::Load(if p.pick(2) == 0 { a.clone() } else { b.clone() }),
             1 if allow_load => DeckCmd::Eject,
             2 => DeckCmd::TogglePlay,
             3 => DeckCmd::Play,
             4 => DeckCmd::Pause,
             5 => DeckCmd::Cue,
-            6 => DeckCmd::HotCue(p.pick(6) as usize),
-            7 => DeckCmd::ClearHotCue(p.pick(6) as usize),
-            8 => DeckCmd::SetHotCues([slot(p), slot(p), slot(p), slot(p)]),
+            6 => DeckCmd::HotCue(p.pick(HOT_CUES as u64 + 2) as usize),
+            7 => DeckCmd::ClearHotCue(p.pick(HOT_CUES as u64 + 2) as usize),
+            8 => DeckCmd::SetHotCues(std::array::from_fn(|_| slot(p))),
             9 => DeckCmd::BeatLoop(v32),
             10 => DeckCmd::ExitLoop,
             11 => DeckCmd::LoopHalve,
@@ -1229,6 +1250,7 @@ mod tests {
             21 => DeckCmd::SetTempoRange(v32),
             22 => DeckCmd::Play,
             23 => DeckCmd::BeatLoop(p.range(0.0, 8.0) as f32),
+            24 => DeckCmd::SetTempoSpeed(v64),
             _ => DeckCmd::Pause,
         }
     }
@@ -1438,6 +1460,44 @@ mod tests {
     }
 
     #[test]
+    fn set_tempo_speed_fits_the_range_and_clamps() {
+        let mut deck = Deck::new(SR as f32);
+        deck.handle(DeckCmd::Load(make_track(SR, 3.0, Some(120.0), 0.0, noise)));
+        deck.handle(DeckCmd::SetTempoSpeed(1.05));
+        let s = deck.state();
+        assert!((s.speed - 1.05).abs() < 1e-9);
+        assert!((s.tempo_range - 0.08).abs() < 1e-6);
+        assert_eq!(deck.tempo_bpm(), Some(126.0));
+
+        deck.handle(DeckCmd::SetTempoSpeed(1.12));
+        assert!((deck.state().tempo_range - 0.16).abs() < 1e-6, "widens");
+        assert!((deck.tempo_speed() - 1.12).abs() < 1e-9);
+
+        deck.handle(DeckCmd::SetTempoSpeed(9.0));
+        assert!((deck.tempo_speed() - 1.5).abs() < 1e-9, "clamped to +50 %");
+        deck.handle(DeckCmd::SetTempoSpeed(0.1));
+        assert!((deck.tempo_speed() - 0.5).abs() < 1e-9, "clamped to -50 %");
+        deck.handle(DeckCmd::SetTempoSpeed(f64::NAN));
+        assert!((deck.tempo_speed() - 0.5).abs() < 1e-9, "NaN ignored");
+    }
+
+    #[test]
+    fn all_hot_cue_slots_store_and_clear() {
+        let mut deck = Deck::new(SR as f32);
+        deck.handle(DeckCmd::Load(make_track(SR, 3.0, None, 0.0, noise)));
+        for i in 0..HOT_CUES {
+            deck.handle(DeckCmd::SeekFraction(i as f64 / 10.0));
+            deck.handle(DeckCmd::HotCue(i));
+            deck.handle(DeckCmd::Pause);
+        }
+        let s = deck.state();
+        assert!(s.hot_cues.iter().all(Option::is_some), "{:?}", s.hot_cues);
+        deck.handle(DeckCmd::ClearHotCue(HOT_CUES - 1));
+        assert_eq!(deck.state().hot_cues[HOT_CUES - 1], None);
+        assert!(deck.state().hot_cues[HOT_CUES - 2].is_some());
+    }
+
+    #[test]
     fn sync_needs_tempo() {
         let track = make_track(SR, 2.0, None, 0.0, sine(SR, 220.0, 0.3));
         let mut deck = loaded(track);
@@ -1530,7 +1590,14 @@ mod tests {
         let track = make_track(SR, 3.0, None, 0.0, sine(SR, 100.0, 0.5));
         let sine_step = max_step(&track);
         let mut deck = loaded(track);
-        deck.handle(DeckCmd::SetHotCues([Some(first), Some(second), None, None]));
+        deck.handle(DeckCmd::SetHotCues([
+            Some(first),
+            Some(second),
+            None,
+            None,
+            None,
+            None,
+        ]));
         deck.handle(DeckCmd::Play);
         run(&mut deck, SR as usize);
         let mut out = Vec::new();
@@ -1569,6 +1636,8 @@ mod tests {
             Some(0.9),
             Some(1.4),
             Some(2.1),
+            None,
+            None,
         ]));
         deck.handle(DeckCmd::Play);
         for i in 0..40 {
@@ -1600,7 +1669,14 @@ mod tests {
         let mut deck = loaded(track);
         seek_secs(&mut deck, 1.3);
         deck.handle(DeckCmd::BeatLoop(4.0));
-        deck.handle(DeckCmd::SetHotCues([Some(6.0), Some(2.0), None, None]));
+        deck.handle(DeckCmd::SetHotCues([
+            Some(6.0),
+            Some(2.0),
+            None,
+            None,
+            None,
+            None,
+        ]));
         deck.handle(DeckCmd::HotCue(0));
         assert!(deck.state().loop_state.is_none());
         run(&mut deck, 1000);
@@ -1619,7 +1695,14 @@ mod tests {
         let mut deck = loaded(track);
         seek_secs(&mut deck, 1.3);
         deck.handle(DeckCmd::BeatLoop(4.0));
-        deck.handle(DeckCmd::SetHotCues([None, Some(2.0), None, None]));
+        deck.handle(DeckCmd::SetHotCues([
+            None,
+            Some(2.0),
+            None,
+            None,
+            None,
+            None,
+        ]));
         deck.handle(DeckCmd::HotCue(1));
         let lp = deck.state().loop_state.expect("loop kept");
         assert!((lp.start_secs - 1.0).abs() < 1e-9);

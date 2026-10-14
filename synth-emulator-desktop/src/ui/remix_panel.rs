@@ -31,6 +31,8 @@ const CUE_COLORS: [Color32; HOT_CUES] = [
     Color32::from_rgb(250, 190, 70),
     Color32::from_rgb(90, 210, 130),
     Color32::from_rgb(170, 120, 250),
+    Color32::from_rgb(240, 130, 200),
+    Color32::from_rgb(120, 220, 230),
 ];
 const LOOP_BEATS: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
 const AUTO_BEATS: [f32; 4] = [4.0, 8.0, 16.0, 32.0];
@@ -402,10 +404,14 @@ impl RemixUi {
                 Key::Num2 => (0, 1),
                 Key::Num3 => (0, 2),
                 Key::Num4 => (0, 3),
+                Key::Num5 => (0, 4),
+                Key::Num6 => (0, 5),
                 Key::Num7 => (1, 0),
                 Key::Num8 => (1, 1),
                 Key::Num9 => (1, 2),
                 Key::Num0 => (1, 3),
+                Key::V => (1, 4),
+                Key::B => (1, 5),
                 _ => return None,
             })
         };
@@ -580,6 +586,8 @@ impl RemixUi {
             ui.add_space(4.0);
         }
         ui.add_space(6.0);
+        tempo_row(ui, state, sink);
+        ui.add_space(6.0);
 
         // Wide windows: deck A | mixer | deck B. Narrow ones (small laptop
         // screens, Windows display scaling): both decks side by side and the
@@ -632,7 +640,7 @@ impl RemixUi {
         ui.add_space(8.0);
         ui.label(
             RichText::new(
-                "Teclado: 1-4 / 7-0 hot cues (Shift apaga) · Q / P play · W / O cue · A S D F / H J K L loop 1 2 4 8 · G / Ç sai do loop · Z X / N M nudge · C / , sync · E R / U I filtro (os dois juntos zeram) · ← ↓ → crossfader · Espaço transição automática · Shift+Q / Shift+P carrega a faixa selecionada · F10 XY pad · Shift+Esc para os dois decks",
+                "Teclado: hot cues 1-4 e 5-6 / 7-0 e V B (Shift apaga) · Q / P play · W / O cue · A S D F / H J K L loop 1 2 4 8 · G / Ç sai do loop · Z X / N M nudge · C / , sync · E R / U I filtro (os dois juntos zeram) · ← ↓ → crossfader · Espaço transição automática · Shift+Q / Shift+P carrega a faixa selecionada · F10 XY pad · Shift+Esc para os dois decks",
             )
             .size(11.5)
             .color(MUTED),
@@ -841,9 +849,9 @@ impl RemixUi {
         let mut changed = false;
         let cmd = |c: DeckCmd| sink.send(RemixCmd::Deck(d, c));
         let keys = if d == 0 {
-            DeckKeys { play: "Q", cue: "W", sync: "C", hot: ["1", "2", "3", "4"], loops: ["A", "S", "D", "F"], exit: "G", nudge: ["Z", "X"], filter: "E R" }
+            DeckKeys { play: "Q", cue: "W", sync: "C", hot: ["1", "2", "3", "4", "5", "6"], loops: ["A", "S", "D", "F"], exit: "G", nudge: ["Z", "X"], filter: "E R" }
         } else {
-            DeckKeys { play: "P", cue: "O", sync: ",", hot: ["7", "8", "9", "0"], loops: ["H", "J", "K", "L"], exit: "Ç", nudge: ["N", "M"], filter: "U I" }
+            DeckKeys { play: "P", cue: "O", sync: ",", hot: ["7", "8", "9", "0", "V", "B"], loops: ["H", "J", "K", "L"], exit: "Ç", nudge: ["N", "M"], filter: "U I" }
         };
         egui::Frame::new()
             .fill(SURFACE)
@@ -900,7 +908,7 @@ impl RemixUi {
                     }
                 });
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for (i, (cue, color)) in ds.hot_cues.iter().zip(CUE_COLORS).enumerate() {
                         let set = cue.is_some();
                         let fill = if set { color } else { ELEVATED };
@@ -1297,6 +1305,28 @@ impl RemixUi {
         }
         changed
     }
+}
+
+/// Shared BPM readout with a +1 / −1 step. It moves the tempo deck, and both
+/// decks while a sync links them, so their beats stay locked.
+fn tempo_row(ui: &mut Ui, state: &RemixState, sink: &dyn RemixSink) {
+    ui.horizontal(|ui| {
+        ui.label(theme::section_label("BPM"));
+        let bpm = state
+            .tempo_deck
+            .and_then(|d| state.decks[d].bpm)
+            .map_or_else(|| "--.--".into(), |b| format!("{b:.2}"));
+        ui.label(RichText::new(bpm).monospace().size(20.0).color(FG));
+        if chip(ui, "−1", false).on_hover_text("Diminui 1 BPM (os decks sincronizados juntos)").clicked() {
+            sink.send(RemixCmd::StepBpm(-1.0));
+        }
+        if chip(ui, "+1", false).on_hover_text("Aumenta 1 BPM (os decks sincronizados juntos)").clicked() {
+            sink.send(RemixCmd::StepBpm(1.0));
+        }
+        if state.synced {
+            ui.label(RichText::new("sincronizados").size(11.0).color(SUBTLE));
+        }
+    });
 }
 
 struct DeckKeys {

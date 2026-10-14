@@ -60,12 +60,63 @@ impl Default for XySettings {
     }
 }
 
+/// Hot cues the first builds knew about. They stay in `hot_cues` on disk, so
+/// older builds still read the file; the extra slots go in `more_cues`, which
+/// older builds ignore.
+const LEGACY_CUES: usize = 4;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(from = "MemoFile", into = "MemoFile")]
 pub struct TrackMemo {
     pub hot_cues: [Option<f64>; remix::HOT_CUES],
     /// Manual / tapped tempo that replaces the detected one.
     pub bpm: Option<f64>,
+}
+
+/// On-disk shape of a memo. Lengths and nulls are not trusted: a short,
+/// long or null list loads what it can, so one odd field cannot make the
+/// whole settings file fail and reset.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct MemoFile {
+    bpm: Option<f64>,
+    hot_cues: Option<Vec<Option<f64>>>,
+    more_cues: Option<Vec<Option<f64>>>,
+}
+
+const _: () = assert!(remix::HOT_CUES >= LEGACY_CUES);
+
+impl From<MemoFile> for TrackMemo {
+    fn from(f: MemoFile) -> Self {
+        let hot = f.hot_cues.unwrap_or_default();
+        let more = f.more_cues.unwrap_or_default();
+        let mut hot_cues = [None; remix::HOT_CUES];
+        for (slot, cue) in hot_cues.iter_mut().zip(hot.iter()) {
+            *slot = *cue;
+        }
+        // Slots past the legacy list come from `more_cues`, unless a file
+        // already carries them in `hot_cues`. Extra entries are ignored.
+        for (i, cue) in more.into_iter().enumerate() {
+            let index = LEGACY_CUES + i;
+            if index < remix::HOT_CUES && index >= hot.len() {
+                hot_cues[index] = cue;
+            }
+        }
+        Self {
+            hot_cues,
+            bpm: f.bpm,
+        }
+    }
+}
+
+impl From<TrackMemo> for MemoFile {
+    fn from(m: TrackMemo) -> Self {
+        Self {
+            bpm: m.bpm,
+            hot_cues: Some(m.hot_cues[..LEGACY_CUES].to_vec()),
+            more_cues: Some(m.hot_cues[LEGACY_CUES..].to_vec()),
+        }
+    }
 }
 
 impl TrackMemo {
@@ -208,6 +259,85 @@ mod tests {
         let s = Settings::load_from(&path);
         assert_eq!(s.auto_beats, 8.0);
         assert_eq!(s.xy, XySettings::default());
+    }
+
+    #[test]
+    fn memo_saved_with_four_hot_cue_slots_still_loads() {
+        let old = r#"{"bpm": 124.0, "hot_cues": [1.5, null, 3.0, null]}"#;
+        let memo: TrackMemo = serde_json::from_str(old).expect("old memo loads");
+        assert_eq!(memo.bpm, Some(124.0));
+        assert_eq!(memo.hot_cues[0], Some(1.5));
+        assert_eq!(memo.hot_cues[2], Some(3.0));
+        assert!(memo.hot_cues[4..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn memo_keeps_all_hot_cues_and_stays_readable_by_four_slot_builds() {
+        let mut memo = TrackMemo::default();
+        memo.hot_cues[1] = Some(2.0);
+        memo.hot_cues[5] = Some(9.5);
+        let json = serde_json::to_string(&memo).unwrap();
+        let back: TrackMemo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, memo);
+        // What an older build reads: `hot_cues` with four entries, and the
+        // unknown `more_cues` key ignored.
+        let legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy["hot_cues"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn json_from_this_build_parses_with_the_88ea342_memo_struct() {
+        // The `TrackMemo` of commit 88ea342, which had four hot-cue slots.
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Build88ea342Memo {
+            hot_cues: [Option<f64>; 4],
+            bpm: Option<f64>,
+        }
+        let mut memo = TrackMemo::default();
+        memo.hot_cues[0] = Some(1.0);
+        memo.hot_cues[5] = Some(7.5);
+        memo.bpm = Some(126.0);
+        let json = serde_json::to_string(&memo).unwrap();
+        let old: Build88ea342Memo = serde_json::from_str(&json).expect("old build reads the file");
+        assert_eq!(old.hot_cues[0], Some(1.0));
+        assert_eq!(old.bpm, Some(126.0));
+    }
+
+    #[test]
+    fn odd_hot_cue_lists_load_what_they_can() {
+        let memo = |json: &str| -> TrackMemo {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{json}: {e}"))
+        };
+        // more_cues of 0, 1, 3 entries, null, and absent: no failure, bpm kept.
+        for more in ["[]", "[3.0]", "[3.0, 4.0, 5.0]", "null"] {
+            let m = memo(&format!(r#"{{"bpm": 124.0, "hot_cues": [1.0, null, 2.0, null], "more_cues": {more}}}"#));
+            assert_eq!(m.bpm, Some(124.0), "more_cues {more}");
+            assert_eq!(m.hot_cues[0], Some(1.0));
+            assert_eq!(m.hot_cues[2], Some(2.0));
+        }
+        let m = memo(r#"{"bpm": 124.0, "hot_cues": [1.0, null, 2.0, null, null]}"#);
+        assert_eq!(m.bpm, Some(124.0), "short hot_cues, no more_cues");
+        assert!(m.hot_cues[4..].iter().all(Option::is_none));
+
+        // more_cues fill slots 4 and 5 and ignore the excess.
+        let m = memo(r#"{"hot_cues": [null, null, null, null], "more_cues": [6.0, 7.0, 8.0]}"#);
+        assert_eq!(m.hot_cues[4], Some(6.0));
+        assert_eq!(m.hot_cues[5], Some(7.0));
+
+        // hot_cues with six entries (written by 214ff4f and 480cbe8): all six
+        // load, and more_cues does not overwrite them.
+        let m = memo(r#"{"hot_cues": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "more_cues": [9.0, 9.0]}"#);
+        assert_eq!(m.hot_cues[4], Some(5.0));
+        assert_eq!(m.hot_cues[5], Some(6.0));
+
+        // hot_cues with two entries, and a null hot_cues.
+        let m = memo(r#"{"hot_cues": [1.0, 2.0], "more_cues": [3.0, 4.0]}"#);
+        assert_eq!(m.hot_cues[1], Some(2.0));
+        assert_eq!(m.hot_cues[2], None, "not taken from more_cues: hot_cues had two entries");
+        let m = memo(r#"{"bpm": 99.0, "hot_cues": null}"#);
+        assert_eq!(m.bpm, Some(99.0));
+        assert!(m.hot_cues.iter().all(Option::is_none));
     }
 
     #[test]
